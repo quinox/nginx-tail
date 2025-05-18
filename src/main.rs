@@ -1,7 +1,11 @@
+use nginx_top::InstantSpeedometer;
+use nginx_top::RingbufferSpeedometer;
+use nginx_top::SmootherSpeedometer;
+use nginx_top::Speedometer;
 use smol::{
     Timer,
     channel::{Receiver, Sender, bounded},
-    fs::{read, read_dir},
+    fs::read_dir,
     stream::StreamExt,
 };
 use std::{fmt::Display, path::PathBuf, time::Duration};
@@ -9,16 +13,16 @@ use std::{fmt::Display, path::PathBuf, time::Duration};
 const HELP: &str = r#"
     Usage:
         --log-root <path>  Path to the nginx log directory
-        --fast-generator   Activate the fast generator (for testing)
-        --slow-generator   Activate the slow generator (for testing)
         -h, --help         Show this help message
 "#;
 
 #[derive(Debug)]
 struct AppArgs {
-    fast_generator: bool,
-    slow_generator: bool,
     log_dir: std::path::PathBuf,
+    #[cfg(debug_assertions)]
+    fast_generator: bool,
+    #[cfg(debug_assertions)]
+    slow_generator: bool,
 }
 
 fn parse_path(s: &std::ffi::OsStr) -> Result<std::path::PathBuf, &'static str> {
@@ -75,32 +79,71 @@ async fn follow(file: PathBuf, channel: Sender<String>) {
 async fn fake_slow(channel: Sender<String>) {
     loop {
         Timer::after(Duration::from_secs(2)).await;
-        channel.send("Fake slow msg".to_string()).await.unwrap();
+        match channel.send("Fake slow msg".to_string()).await {
+            Ok(_) => {}
+            Err(_) => {
+                // Channel closed
+                return;
+            }
+        }
     }
 }
 #[cfg(debug_assertions)]
 async fn fake_fast(channel: Sender<String>) {
     loop {
-        Timer::after(Duration::from_millis(5)).await;
-        channel.send("Fake fast msg".to_string()).await.unwrap();
+        Timer::after(Duration::from_millis(100)).await;
+        for i in 0..100 {
+            match channel.send(format!("Fake fast msg {}", i)).await {
+                Ok(_) => {}
+                Err(_) => {
+                    // Channel closed
+                    return;
+                }
+            }
+        }
     }
 }
 
 async fn process(channel: Receiver<String>) {
-    let mut count = 0;
+    let mut instant_rate = InstantSpeedometer::new();
+    let mut fast_rate = RingbufferSpeedometer::new(2 << 1);
+    let mut slow_rate = RingbufferSpeedometer::new(2 << 8);
+    let mut smooth_rate = SmootherSpeedometer::new(0.2);
+    let start = std::time::Instant::now();
+
     loop {
-        let msg = channel.recv().await.unwrap();
-        count += 1;
-        println!("I got: {}", msg);
-        if count == 2 {
-            println!("We've seen 2 messsages, that's plenty for now");
-            return;
+        let last_timestamp = std::time::Instant::now();
+        Timer::after(Duration::from_secs(1)).await;
+        let time_passed = std::time::Instant::now()
+            .duration_since(last_timestamp)
+            .as_millis();
+
+        let mut count = 0;
+        while let Ok(_msg) = channel.try_recv() {
+            count += 1;
+            // println!("I got: {}", msg);
+        }
+        instant_rate.add_measurement(time_passed, count);
+        fast_rate.add_measurement(time_passed, count);
+        slow_rate.add_measurement(time_passed, count);
+        smooth_rate.add_measurement(time_passed, count);
+
+        println!(
+            "{:6.1} msg/s [instant]   {:6.1} msg/s [fast-ring]   {:6.1} msg/s [slow-ring]   {:6.1} msg/s [smooth]",
+            instant_rate.get_speed(),
+            fast_rate.get_speed(),
+            slow_rate.get_speed(),
+            smooth_rate.get_speed(),
+        );
+        if std::time::Instant::now().duration_since(start).as_secs() > 15 {
+            println!("Exiting after 10 seconds");
+            break;
         }
     }
 }
 
 async fn innermain(args: AppArgs) -> Result<(), Error> {
-    let (sender, receiver) = bounded(100);
+    let (sender, receiver) = bounded(10000);
 
     let mut dirs_to_check = vec![args.log_dir];
 
@@ -120,6 +163,7 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
         }
     }
 
+    #[allow(clippy::manual_while_let_some)]
     while !dirs_to_check.is_empty() {
         let dir_to_check = dirs_to_check.pop().unwrap();
 
