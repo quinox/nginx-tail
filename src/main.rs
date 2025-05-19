@@ -2,6 +2,8 @@ use nginx_top::InstantSpeedometer;
 use nginx_top::RingbufferSpeedometer;
 use nginx_top::SmootherSpeedometer;
 use nginx_top::Speedometer;
+use smol::io::AsyncReadExt as _;
+use smol::io::AsyncSeekExt as _;
 use smol::{
     Timer,
     channel::{Receiver, Sender, bounded},
@@ -13,12 +15,14 @@ use std::{fmt::Display, path::PathBuf, time::Duration};
 const HELP: &str = r#"
     Usage:
         --log-root <path>  Path to the nginx log directory
+        --log-file <file>  Path to the nginx log file
         -h, --help         Show this help message
 "#;
 
 #[derive(Debug)]
 struct AppArgs {
-    log_dir: std::path::PathBuf,
+    log_dirs: Vec<std::path::PathBuf>,
+    log_files: Vec<std::path::PathBuf>,
     #[cfg(debug_assertions)]
     fast_generator: bool,
     #[cfg(debug_assertions)]
@@ -27,29 +31,6 @@ struct AppArgs {
 
 fn parse_path(s: &std::ffi::OsStr) -> Result<std::path::PathBuf, &'static str> {
     Ok(s.into())
-}
-
-fn main() {
-    let mut pargs = pico_args::Arguments::from_env();
-    if pargs.contains(["-h", "--help"]) {
-        println!("{}", HELP);
-        std::process::exit(0);
-    }
-
-    let log_dir = pargs
-        .opt_value_from_os_str("--log-root", parse_path)
-        .unwrap()
-        .unwrap_or_else(|| "/var/log/nginx/".into());
-
-    let args = AppArgs {
-        fast_generator: pargs.contains("--fast"),
-        slow_generator: pargs.contains("--slow"),
-        log_dir,
-    };
-    match smol::block_on(innermain(args)) {
-        Ok(_) => {}
-        Err(ex) => eprintln!("Runtime failure: {}", ex),
-    }
 }
 
 struct Error(String);
@@ -71,8 +52,36 @@ impl Display for Error {
 }
 
 async fn follow(file: PathBuf, channel: Sender<String>) {
-    Timer::after(Duration::from_secs(1)).await;
-    channel.send(format!("Slept for {:?}", file)).await.unwrap();
+    let mut file = smol::fs::File::open(&file).await.unwrap();
+    // Seek to the end of the file
+    println!("Following file {:?}", file);
+    if file.seek(std::io::SeekFrom::End(0)).await.is_err() {
+        eprintln!("Error seeking to end of file {:?}", file);
+        return;
+    }
+    let mut buf = vec![0; 1024];
+    loop {
+        match file.read(&mut buf).await {
+            Ok(0) => {
+                // EOF, at least for now
+                Timer::after(Duration::from_millis(50)).await;
+            }
+            Ok(n) => {
+                // TODO: Don't assume UTF-8
+                // TODO: Support zero newlines found (partial line)
+                // TODO: Support multiple newlines found (multiple lines) (easy to test by using a small buf)
+                let msg = String::from_utf8_lossy(&buf[..n]);
+                if channel.send(msg.to_string()).await.is_err() {
+                    // Channel closed
+                    return;
+                }
+            }
+            Err(e) => {
+                eprintln!("Error reading file {:?}: {}", file, e);
+                return;
+            }
+        }
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -142,24 +151,84 @@ async fn process(channel: Receiver<String>) {
     }
 }
 
+fn main() {
+    let mut pargs = pico_args::Arguments::from_env();
+    if pargs.contains(["-h", "--help"]) {
+        println!("{}", HELP);
+        std::process::exit(0);
+    }
+
+    let mut log_dirs = vec![];
+    while let Some(log_dir) = pargs
+        .opt_value_from_os_str("--log-root", parse_path)
+        .unwrap()
+    {
+        if !log_dir.is_dir() {
+            eprintln!("Error: --log-root must be a directory");
+            std::process::exit(1);
+        }
+        log_dirs.push(log_dir);
+    }
+    if log_dirs.is_empty() {
+        log_dirs.push("/var/log/nginx/".into());
+    }
+
+    let mut log_files = vec![];
+    while let Some(log_file) = pargs
+        .opt_value_from_os_str("--log-file", parse_path)
+        .unwrap()
+    {
+        log_files.push(log_file);
+    }
+
+    let args = AppArgs {
+        fast_generator: pargs.contains("--fast"),
+        slow_generator: pargs.contains("--slow"),
+        log_dirs,
+        log_files,
+    };
+
+    let remaining = pargs.finish();
+    if !remaining.is_empty() {
+        eprintln!("{}", HELP);
+        eprintln!("Warning: unused arguments left: {:?}.", remaining);
+        std::process::exit(2);
+    }
+
+    match smol::block_on(innermain(args)) {
+        Ok(_) => {}
+        Err(ex) => eprintln!("Runtime failure: {}", ex),
+    }
+}
+
 async fn innermain(args: AppArgs) -> Result<(), Error> {
     let (sender, receiver) = bounded(10000);
+    let mut senders = 0;
 
-    let mut dirs_to_check = vec![args.log_dir];
+    for log_file in args.log_files {
+        if !log_file.is_file() {
+            // things can still go wrong (if the file isn't readable or something)
+            // but at least we tried our best
+            eprintln!("WARNING: Log file {:?} is not a file", log_file);
+        } else {
+            smol::spawn(follow(log_file, sender.clone())).detach();
+            senders += 1;
+        }
+    }
 
-    let mut readers = 0;
+    let mut dirs_to_check = args.log_dirs;
 
     #[cfg(debug_assertions)]
     {
         if args.fast_generator {
             println!("Fast generator enabled");
             smol::spawn(fake_fast(sender.clone())).detach();
-            readers += 1;
+            senders += 1;
         }
         if args.slow_generator {
             println!("Slow generator enabled");
             smol::spawn(fake_slow(sender.clone())).detach();
-            readers += 1;
+            senders += 1;
         }
     }
 
@@ -185,13 +254,14 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
                     {
                         println!("Added {:?} as reader", entry.path());
                         smol::spawn(follow(entry.path(), sender.clone())).detach();
-                        readers += 1;
+                        senders += 1;
                     }
                 }
             }
         }
     }
-    if readers == 0 {
+
+    if senders == 0 {
         return Err(Error("No useable log files found".to_string()));
     }
 

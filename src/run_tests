@@ -1,0 +1,94 @@
+#!/bin/bash
+set -eu
+cd "$(dirname "$0")"
+source helpers/helperhelper.sh
+
+
+test_build() {
+    banner "cargo build"
+    cargo build
+}
+
+test_clippy() {
+    banner "cargo clippy"
+    cargo clippy -- --deny warnings
+}
+
+test_fmt() {
+	banner "cargo fmt"
+	cargo fmt --all -- --check
+}
+
+test_shear() {
+	banner "cargo shear"
+	pre=$(git status Cargo.toml --porcelain)
+	if [[ -n "$pre" ]]
+	then
+		echo "Can't test: Cargo.toml isn't committed."
+		return
+	fi
+	if ! cargo shear --help >/dev/null 2>&1
+	then
+		die "Command not found: cargo shear. Please install it: cargo install cargo-shear"
+	fi
+	cargo shear --fix
+	post=$(git status Cargo.toml --porcelain)
+	if [[ -n "$post" ]]
+	then
+		die "Unused dependencies as reported by 'cargo shear --fix'. See 'git diff'"
+	fi
+}
+
+test_shellcheck() {
+	banner "ShellCheck"
+	command -v shellcheck >/dev/null || die "Please install shellcheck first: sudo apt install shellcheck"
+
+	# TODO: Check we've tested all Bash scripts
+	shellcheck -x helpers/helperhelper.sh run_tests
+}
+
+test_test() {
+	banner "cargo test"
+	cargo test
+}
+
+test_all() {
+	test_shear
+
+	echo ""
+	test_clippy
+
+	# Redundant since clippy also builds?
+	echo ""
+	test_build
+
+	echo ""
+	test_fmt
+
+	echo ""
+	test_shellcheck
+
+	echo ""
+	test_test
+}
+
+if [[ $# -eq 0 ]]
+then
+	test_all
+else
+
+	while [[ $# -gt 0 ]]
+	do
+		func="test_$1"
+		if command -v "$func" >/dev/null
+		then
+			"$func"
+		else
+			die "Unknown test $1"
+		fi
+		shift
+	done
+fi
+
+echo ""
+echo "All testcases passed."
