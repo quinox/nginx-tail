@@ -10,6 +10,7 @@ use smol::{
     fs::read_dir,
     stream::StreamExt,
 };
+use std::io::Write as _;
 use std::{fmt::Display, path::PathBuf, time::Duration};
 
 const HELP: &str = r#"
@@ -59,21 +60,28 @@ async fn follow(file: PathBuf, channel: Sender<String>) {
         eprintln!("Error seeking to end of file {:?}", file);
         return;
     }
-    let mut buf = vec![0; 1024];
+    let mut pending = vec![];
+    let mut readbuf = vec![0; 1024];
     loop {
-        match file.read(&mut buf).await {
+        match file.read(&mut readbuf).await {
             Ok(0) => {
                 // EOF, at least for now
                 Timer::after(Duration::from_millis(50)).await;
             }
             Ok(n) => {
-                // TODO: Don't assume UTF-8
-                // TODO: Support zero newlines found (partial line)
-                // TODO: Support multiple newlines found (multiple lines) (easy to test by using a small buf)
-                let msg = String::from_utf8_lossy(&buf[..n]);
-                if channel.send(msg.to_string()).await.is_err() {
-                    // Channel closed
-                    return;
+                // newline in the dat we just read?
+                if let Some(first_newline) = readbuf.iter().position(|x| *x == b'\n') {
+                    let line =
+                        String::from_utf8_lossy(&[&pending, &readbuf[..first_newline]].concat())
+                            .to_string();
+                    if channel.send(line).await.is_err() {
+                        // Channel closed
+                        return;
+                    }
+                    pending.clear();
+                } else {
+                    // No newline, so we need to keep the data around
+                    pending.extend_from_slice(&readbuf[..n]);
                 }
             }
             Err(e) => {
@@ -127,25 +135,29 @@ async fn process(channel: Receiver<String>) {
             .duration_since(last_timestamp)
             .as_millis();
 
+        // Move cursor to the beginning of the line and clear the line
+        print!("\r\x1b[K");
         let mut count = 0;
-        while let Ok(_msg) = channel.try_recv() {
+        while let Ok(msg) = channel.try_recv() {
             count += 1;
-            // println!("I got: {}", msg);
+            println!("{}", msg);
         }
+
         instant_rate.add_measurement(time_passed, count);
         fast_rate.add_measurement(time_passed, count);
         slow_rate.add_measurement(time_passed, count);
         smooth_rate.add_measurement(time_passed, count);
 
-        println!(
+        print!(
             "{:6.1} msg/s [instant]   {:6.1} msg/s [fast-ring]   {:6.1} msg/s [slow-ring]   {:6.1} msg/s [smooth]",
             instant_rate.get_speed(),
             fast_rate.get_speed(),
             slow_rate.get_speed(),
             smooth_rate.get_speed(),
         );
+        std::io::stdout().flush().unwrap();
         if std::time::Instant::now().duration_since(start).as_secs() > 15 {
-            println!("Exiting after 10 seconds");
+            println!("\nExiting after 10 seconds");
             break;
         }
     }
