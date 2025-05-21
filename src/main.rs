@@ -17,6 +17,7 @@ const HELP: &str = r#"
     Usage:
         --log-root <path>  Path to the nginx log directory
         --log-file <file>  Path to the nginx log file
+        -x, --speed-test   Test your terminal speed
         -h, --help         Show this help message
 "#;
 
@@ -52,7 +53,9 @@ impl Display for Error {
     }
 }
 
-async fn follow(file: PathBuf, channel: Sender<String>) {
+type SenderChannel = Sender<Message>;
+
+async fn follow(file: PathBuf, channel: SenderChannel) {
     let mut file = smol::fs::File::open(&file).await.unwrap();
     // Seek to the end of the file
     println!("Following file {:?}", file);
@@ -83,7 +86,7 @@ async fn follow(file: PathBuf, channel: Sender<String>) {
                             &uninterrupted_slice[starting_pointer..ending_pointer],
                         )
                         .to_string();
-                        if channel.send(line).await.is_err() {
+                        if channel.send(Message::Line(line)).await.is_err() {
                             // Channel closed
                             return;
                         }
@@ -111,11 +114,30 @@ async fn follow(file: PathBuf, channel: Sender<String>) {
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum Message {
+    Print,
+    Line(String),
+}
+async fn periodic_print(channel: SenderChannel) {
+    loop {
+        match channel.send(Message::Print).await {
+            Ok(_) => {
+                Timer::after(Duration::from_millis(1000)).await;
+            }
+            Err(_) => return,
+        }
+    }
+}
+
 #[cfg(debug_assertions)]
-async fn fake_slow(channel: Sender<String>) {
+async fn fake_slow(channel: SenderChannel) {
     loop {
         Timer::after(Duration::from_secs(2)).await;
-        match channel.send("Fake slow msg".to_string()).await {
+        match channel
+            .send(Message::Line("Fake slow msg".to_string()))
+            .await
+        {
             Ok(_) => {}
             Err(_) => {
                 // Channel closed
@@ -125,11 +147,14 @@ async fn fake_slow(channel: Sender<String>) {
     }
 }
 #[cfg(debug_assertions)]
-async fn fake_fast(channel: Sender<String>) {
+async fn fake_fast(channel: SenderChannel) {
     loop {
         Timer::after(Duration::from_millis(100)).await;
         for i in 0..100 {
-            match channel.send(format!("Fake fast msg {}", i)).await {
+            match channel
+                .send(Message::Line(format!("Fake fast msg {}", i)))
+                .await
+            {
                 Ok(_) => {}
                 Err(_) => {
                     // Channel closed
@@ -143,59 +168,104 @@ async fn fake_fast(channel: Sender<String>) {
 // https://en.wikipedia.org/wiki/ANSI_escape_code#CSI_(Control_Sequence_Introducer)_sequences
 const CSI: &str = "\x1b[";
 
-async fn process(channel: Receiver<String>) {
+async fn process(channel: Receiver<Message>) {
     let mut instant_rate = InstantSpeedometer::new();
     let mut fast_rate = RingbufferSpeedometer::new(2 << 1);
     let mut slow_rate = RingbufferSpeedometer::new(2 << 8);
     let mut smooth_rate = SmootherSpeedometer::new(0.2);
     let start = std::time::Instant::now();
 
-    let gutter = 3;
+    let mut pending_lines = vec![];
+    let max_lines_to_print_at_once = 2;
+    let gutter = 5;
+
+    print!("{}", "\n".repeat(gutter)); // making space so we can scroll up later
     loop {
-        let last_timestamp = std::time::Instant::now();
-        Timer::after(Duration::from_secs(1)).await;
-        let time_passed = std::time::Instant::now()
-            .duration_since(last_timestamp)
-            .as_millis();
+        match channel.recv().await {
+            Err(_) => {
+                eprintln!("Channel closed.");
+                return;
+            }
+            Ok(Message::Line(line)) => pending_lines.push(line),
+            Ok(Message::Print) => {
+                let last_timestamp = std::time::Instant::now();
+                Timer::after(Duration::from_secs(1)).await;
+                let time_passed = std::time::Instant::now()
+                    .duration_since(last_timestamp)
+                    .as_millis();
 
-        //             _______________________ move cursor to beginning of line
-        //            |              _________ move cursor up X lines
-        //            |             |      ___ clear to end of screen
-        //            |             |     |
-        print!("{CSI}\r{CSI}{gutter}A{CSI}J");
-        let mut count = 0;
-        while let Ok(msg) = channel.try_recv() {
-            count += 1;
-            println!("{}", msg);
-        }
+                //             _______________________ move cursor to beginning of line
+                //            |              _________ move cursor up X lines
+                //            |             |      ___ clear to end of screen
+                //            |             |     |
+                print!("{CSI}\r{CSI}{gutter}A{CSI}J");
 
-        instant_rate.add_measurement(time_passed, count);
-        fast_rate.add_measurement(time_passed, count);
-        slow_rate.add_measurement(time_passed, count);
-        smooth_rate.add_measurement(time_passed, count);
+                let mut samplerate = 100;
+                match pending_lines.len() {
+                    0 => {}
+                    1..2 => {
+                        println!("{}", pending_lines.join("\n"))
+                    }
+                    _ => {
+                        samplerate = max_lines_to_print_at_once * 100 / pending_lines.len();
+                        println!("{}", pending_lines[..max_lines_to_print_at_once].join("\n"));
+                    }
+                }
+                let count =
+                    u128::try_from(pending_lines.len()).expect("line count is impossibly high");
+                instant_rate.add_measurement(time_passed, count);
+                fast_rate.add_measurement(time_passed, count);
+                slow_rate.add_measurement(time_passed, count);
+                smooth_rate.add_measurement(time_passed, count);
 
-        print!(
-            r#"smooth:    {:6.1} msg/s
+                print!(
+                    r#"
+Output sampled at {}%
+smooth:    {:6.1} msg/s
 slow-ring: {:6.1} msg/s
 fast-ring: {:6.1} msg/s
 instant:   {:6.1} msg/s"#,
-            instant_rate.get_speed(),
-            fast_rate.get_speed(),
-            slow_rate.get_speed(),
-            smooth_rate.get_speed()
-        );
-        std::io::stdout().flush().unwrap();
-        if std::time::Instant::now().duration_since(start).as_secs() > 15 {
-            println!("\nExiting after 10 seconds");
-            break;
+                    samplerate,
+                    instant_rate.get_speed(),
+                    fast_rate.get_speed(),
+                    slow_rate.get_speed(),
+                    smooth_rate.get_speed()
+                );
+                pending_lines.clear();
+                std::io::stdout().flush().unwrap();
+                if std::time::Instant::now().duration_since(start).as_secs() > 15 {
+                    println!("\nExiting after 10 seconds");
+                    break;
+                }
+            }
         }
     }
+}
+
+fn speedtest() {
+    let start = std::time::Instant::now();
+    let mut lines = 0;
+    let nginx_line = "measuring... ".repeat(20) + "\n";
+    let nginx_line = nginx_line.as_bytes();
+    while std::time::Instant::now().duration_since(start).as_secs() < 5 {
+        std::io::stdout().write_all(nginx_line).unwrap();
+        std::io::stdout().flush().unwrap();
+        lines += 1;
+    }
+    println!(
+        "Your setup managed to output {} lines per second",
+        lines / std::time::Instant::now().duration_since(start).as_secs()
+    );
 }
 
 fn main() {
     let mut pargs = pico_args::Arguments::from_env();
     if pargs.contains(["-h", "--help"]) {
         println!("{}", HELP);
+        std::process::exit(0);
+    }
+    if pargs.contains(["-x", "--speed-test"]) {
+        speedtest();
         std::process::exit(0);
     }
 
@@ -243,8 +313,8 @@ fn main() {
 }
 
 async fn innermain(args: AppArgs) -> Result<(), Error> {
-    let (sender, receiver) = bounded(10000);
     let mut senders = 0;
+    let (sender, receiver) = bounded(10000);
 
     for log_file in args.log_files {
         if !log_file.is_file() {
@@ -306,12 +376,15 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
         return Err(Error("No useable log files found".to_string()));
     }
 
+    smol::spawn(periodic_print(sender.clone())).detach();
+
     smol::spawn(process(receiver)).await;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::Message;
     use crate::follow;
     use smol::LocalExecutor;
     use smol::Timer;
@@ -344,7 +417,10 @@ mod tests {
             // One whole line written
             file.write_all(b"line 3\n").unwrap();
             Timer::after(Duration::from_millis(70)).await;
-            assert_eq!(receiver.try_recv().unwrap(), "line 3");
+            assert_eq!(
+                receiver.try_recv().unwrap(),
+                Message::Line("line 3".to_owned())
+            );
 
             // One line written in 2 separate parts
             // First bit...
@@ -360,20 +436,38 @@ mod tests {
             // ..and the last bit
             file.write_all(b" and a bit\n").unwrap();
             Timer::after(Duration::from_millis(70)).await;
-            assert_eq!(receiver.try_recv().unwrap(), "line 4... and a bit");
+            assert_eq!(
+                receiver.try_recv().unwrap(),
+                Message::Line("line 4... and a bit".to_owned())
+            );
 
             // Two lines written at once
             file.write_all(b"line 5\nline 6\n").unwrap();
             Timer::after(Duration::from_millis(70)).await;
-            assert_eq!(receiver.try_recv().unwrap(), "line 5");
-            assert_eq!(receiver.try_recv().unwrap(), "line 6");
+            assert_eq!(
+                receiver.try_recv().unwrap(),
+                Message::Line("line 5".to_owned())
+            );
+            assert_eq!(
+                receiver.try_recv().unwrap(),
+                Message::Line("line 6".to_owned())
+            );
 
             // Three and a half lines at once
             file.write_all(b"line 7\nline 8\nline 9\nline 0").unwrap();
             Timer::after(Duration::from_millis(70)).await;
-            assert_eq!(receiver.try_recv().unwrap(), "line 7");
-            assert_eq!(receiver.try_recv().unwrap(), "line 8");
-            assert_eq!(receiver.try_recv().unwrap(), "line 9");
+            assert_eq!(
+                receiver.try_recv().unwrap(),
+                Message::Line("line 7".to_owned())
+            );
+            assert_eq!(
+                receiver.try_recv().unwrap(),
+                Message::Line("line 8".to_owned())
+            );
+            assert_eq!(
+                receiver.try_recv().unwrap(),
+                Message::Line("line 9".to_owned())
+            );
             assert!(receiver.try_recv().is_err());
         }));
     }
