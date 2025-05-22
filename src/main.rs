@@ -10,6 +10,7 @@ use smol::{
     fs::read_dir,
     stream::StreamExt,
 };
+use std::collections::VecDeque;
 use std::io::Write as _;
 use std::{fmt::Display, path::PathBuf, time::Duration};
 
@@ -29,6 +30,7 @@ struct AppArgs {
     fast_generator: bool,
     #[cfg(debug_assertions)]
     slow_generator: bool,
+    number_of_lines: u64,
 }
 
 fn parse_path(s: &std::ffi::OsStr) -> Result<std::path::PathBuf, &'static str> {
@@ -58,9 +60,9 @@ type SenderChannel = Sender<Message>;
 async fn follow(file: PathBuf, channel: SenderChannel) {
     let mut file = smol::fs::File::open(&file).await.unwrap();
     // Seek to the end of the file
-    println!("Following file {:?}", file);
+    println!("Following file {file:?}");
     if file.seek(std::io::SeekFrom::End(0)).await.is_err() {
-        eprintln!("Error seeking to end of file {:?}", file);
+        eprintln!("Error seeking to end of file {file:?}");
         return;
     }
     let mut pending = vec![];
@@ -107,7 +109,7 @@ async fn follow(file: PathBuf, channel: SenderChannel) {
                 }
             }
             Err(e) => {
-                eprintln!("Error reading file {:?}: {}", file, e);
+                eprintln!("Error reading file {file:?}: {e}");
                 return;
             }
         }
@@ -152,7 +154,7 @@ async fn fake_fast(channel: SenderChannel) {
         Timer::after(Duration::from_millis(100)).await;
         for i in 0..100 {
             match channel
-                .send(Message::Line(format!("Fake fast msg {}", i)))
+                .send(Message::Line(format!("Fake fast msg {i}")))
                 .await
             {
                 Ok(_) => {}
@@ -168,15 +170,15 @@ async fn fake_fast(channel: SenderChannel) {
 // https://en.wikipedia.org/wiki/ANSI_escape_code#CSI_(Control_Sequence_Introducer)_sequences
 const CSI: &str = "\x1b[";
 
-async fn process(channel: Receiver<Message>) {
+async fn process(channel: Receiver<Message>, number_of_lines: u64) {
     let mut instant_rate = InstantSpeedometer::new();
     let mut fast_rate = RingbufferSpeedometer::new(2 << 1);
     let mut slow_rate = RingbufferSpeedometer::new(2 << 8);
     let mut smooth_rate = SmootherSpeedometer::new(0.2);
     let start = std::time::Instant::now();
 
-    let mut pending_lines = vec![];
-    let max_lines_to_print_at_once = 2;
+    let mut pending_lines: VecDeque<String> = VecDeque::with_capacity(number_of_lines as usize);
+    let mut lines_skipped: i64 = 0;
     let gutter = 5;
 
     print!("{}", "\n".repeat(gutter)); // making space so we can scroll up later
@@ -186,7 +188,13 @@ async fn process(channel: Receiver<Message>) {
                 eprintln!("Channel closed.");
                 return;
             }
-            Ok(Message::Line(line)) => pending_lines.push(line),
+            Ok(Message::Line(line)) => {
+                if pending_lines.len() as u64 >= number_of_lines {
+                    pending_lines.pop_front();
+                    lines_skipped += 1;
+                };
+                pending_lines.push_back(line);
+            }
             Ok(Message::Print) => {
                 let last_timestamp = std::time::Instant::now();
                 Timer::after(Duration::from_secs(1)).await;
@@ -200,17 +208,19 @@ async fn process(channel: Receiver<Message>) {
                 //            |             |     |
                 print!("{CSI}\r{CSI}{gutter}A{CSI}J");
 
-                let mut samplerate = 100;
-                match pending_lines.len() {
-                    0 => {}
-                    1..2 => {
-                        println!("{}", pending_lines.join("\n"))
-                    }
+                let samplerate: i64 = match lines_skipped {
+                    0 => 100,
                     _ => {
-                        samplerate = max_lines_to_print_at_once * 100 / pending_lines.len();
-                        println!("{}", pending_lines[..max_lines_to_print_at_once].join("\n"));
+                        (100 * pending_lines.len() as i64)
+                            / (lines_skipped + pending_lines.len() as i64)
                     }
+                };
+                for line in pending_lines.iter() {
+                    println!("{line}");
                 }
+                pending_lines.clear();
+                lines_skipped = 0;
+
                 let count =
                     u128::try_from(pending_lines.len()).expect("line count is impossibly high");
                 instant_rate.add_measurement(time_passed, count);
@@ -231,7 +241,6 @@ instant:   {:6.1} msg/s"#,
                     slow_rate.get_speed(),
                     smooth_rate.get_speed()
                 );
-                pending_lines.clear();
                 std::io::stdout().flush().unwrap();
                 if std::time::Instant::now().duration_since(start).as_secs() > 15 {
                     println!("\nExiting after 10 seconds");
@@ -261,7 +270,7 @@ fn speedtest() {
 fn main() {
     let mut pargs = pico_args::Arguments::from_env();
     if pargs.contains(["-h", "--help"]) {
-        println!("{}", HELP);
+        println!("{HELP}");
         std::process::exit(0);
     }
     if pargs.contains(["-x", "--speed-test"]) {
@@ -292,23 +301,26 @@ fn main() {
         log_files.push(log_file);
     }
 
+    let number_of_lines: u64 = pargs.value_from_str("--lines").unwrap_or(3);
+
     let args = AppArgs {
         fast_generator: pargs.contains("--fast"),
         slow_generator: pargs.contains("--slow"),
         log_dirs,
         log_files,
+        number_of_lines,
     };
 
     let remaining = pargs.finish();
     if !remaining.is_empty() {
-        eprintln!("{}", HELP);
-        eprintln!("Warning: unused arguments left: {:?}.", remaining);
+        eprintln!("{HELP}");
+        eprintln!("Warning: unused arguments left: {remaining:?}.");
         std::process::exit(2);
     }
 
     match smol::block_on(innermain(args)) {
         Ok(_) => {}
-        Err(ex) => eprintln!("Runtime failure: {}", ex),
+        Err(ex) => eprintln!("Runtime failure: {ex}"),
     }
 }
 
@@ -320,7 +332,7 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
         if !log_file.is_file() {
             // things can still go wrong (if the file isn't readable or something)
             // but at least we tried our best
-            eprintln!("WARNING: Log file {:?} is not a file", log_file);
+            eprintln!("WARNING: Log file {log_file:?} is not a file");
         } else {
             smol::spawn(follow(log_file, sender.clone())).detach();
             senders += 1;
@@ -350,8 +362,7 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
         match read_dir(dir_to_check.clone()).await {
             Err(e) => {
                 println!(
-                    "WARNING: Failed to read directory {:?}: {}",
-                    dir_to_check, e
+                    "WARNING: Failed to read directory {dir_to_check:?}: {e}"
                 );
                 continue;
             }
@@ -378,7 +389,7 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
 
     smol::spawn(periodic_print(sender.clone())).detach();
 
-    smol::spawn(process(receiver)).await;
+    smol::spawn(process(receiver, args.number_of_lines)).await;
     Ok(())
 }
 
