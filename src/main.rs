@@ -11,7 +11,6 @@ use smol::{
     fs::read_dir,
     stream::StreamExt,
 };
-use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io::Write as _;
 use std::str::FromStr;
@@ -20,13 +19,12 @@ use std::{fmt::Display, path::PathBuf, time::Duration};
 
 const HELP: &str = r#"
     Usage:
-        --log-root <path>  Path to the nginx log directory
-        --log-file <file>  Path to the nginx log file
-        -x, --speed-test   Test your terminal speed
-        -h, --help         Show this help message
+        --log-root <path>                    Path to the nginx log directory
+        --log-file <file>                    Path to the nginx log file
+        --tagger [ filename | status_code ]  How to group the stats
+        -x, --speed-test                     Test your terminal speed
+        -h, --help                           Show this help message
 "#;
-
-const GUTTER: u16 = 5;
 
 #[derive(Debug)]
 struct AppArgs {
@@ -136,7 +134,7 @@ async fn follow_tag_filename(channel: SenderChannel, file: PathBuf, filename: St
     loop {
         match processor.read_lines().await {
             Ok(lines) => {
-                if lines.len() == 0 {
+                if lines.is_empty() {
                     // EOF, at least for now
                     Timer::after(Duration::from_millis(50)).await;
                     continue;
@@ -175,7 +173,7 @@ async fn follow_tag_statuscode(channel: SenderChannel, file: PathBuf) {
     loop {
         match processor.read_lines().await {
             Ok(lines) => {
-                if lines.len() == 0 {
+                if lines.is_empty() {
                     // EOF, at least for now
                     Timer::after(Duration::from_millis(50)).await;
                     continue;
@@ -220,16 +218,17 @@ async fn periodic_print(channel: SenderChannel) {
 
 #[cfg(debug_assertions)]
 async fn fake_slow(channel: SenderChannel) {
+    let mut counter: u32 = 0;
     loop {
         Timer::after(Duration::from_secs(2)).await;
         match channel
             .send(Message::Line {
-                text: "Fake slow msg".to_string(),
-                tag: "fastfake".to_owned(),
+                text: format!("Fake slow msg {}", counter),
+                tag: "slowloris".to_owned(),
             })
             .await
         {
-            Ok(_) => {}
+            Ok(_) => counter += 1,
             Err(_) => {
                 // Channel closed
                 return;
@@ -262,30 +261,53 @@ async fn fake_fast(channel: SenderChannel) {
 // https://en.wikipedia.org/wiki/ANSI_escape_code#CSI_(Control_Sequence_Introducer)_sequences
 const CSI: &str = "\x1b[";
 
-async fn process(channel: Receiver<Message>, number_of_lines: u16) {
-    let mut instant_rate = InstantSpeedometer::new();
-    let mut fast_rate = RingbufferSpeedometer::new(2 << 1);
-    let mut slow_rate = RingbufferSpeedometer::new(2 << 8);
-    let mut smooth_rate = SmootherSpeedometer::new(0.2);
+struct TagMap {
+    tag: String,
+    pending: u32,
+    instant: InstantSpeedometer,
+    slow: RingbufferSpeedometer,
+    smooth: SmootherSpeedometer,
+}
+impl TagMap {
+    fn new(tag: String) -> Self {
+        Self {
+            tag,
+            pending: 0,
+            instant: InstantSpeedometer::new(),
+            slow: RingbufferSpeedometer::new(2 << 8),
+            smooth: SmootherSpeedometer::new(0.2),
+        }
+    }
+}
+
+async fn process(channel: Receiver<Message>, screenheight: u16) {
     let start = std::time::Instant::now();
-
-    let mut pending_lines: VecDeque<String> = VecDeque::with_capacity(number_of_lines as usize);
+    let mut pending_lines: VecDeque<String> = VecDeque::with_capacity(screenheight as usize);
     let mut lines_skipped: u32 = 0;
+    let mut tags: Vec<TagMap> = vec![]; // in order of printing
+    let mut last_gutter_count: u32 = 0;
 
-    // print!("{}", "\n".repeat(GUTTER.into())); // making space so we can scroll up later
-    let mut first_loop = true;
     loop {
+        let number_of_lines = screenheight - tags.len() as u16 - 2; // we'll try to show the last output line of last time at the top 
         match channel.recv().await {
             Err(_) => {
                 eprintln!("Channel closed.");
                 return;
             }
-            Ok(Message::Line { text, tag: _tag }) => {
+            Ok(Message::Line { text, tag }) => {
                 if pending_lines.len() >= number_of_lines.into() {
                     pending_lines.pop_front();
                     lines_skipped += 1;
                 };
                 pending_lines.push_back(text);
+
+                // we only expect up to 5 tags so is prolly faster than a hashmap
+                let tagmap = tags.iter_mut().find(|x| x.tag == tag);
+                if let Some(tagmap) = tagmap {
+                    tagmap.pending += 1;
+                } else {
+                    tags.push(TagMap::new(tag));
+                }
             }
             Ok(Message::Print) => {
                 let last_timestamp = std::time::Instant::now();
@@ -299,14 +321,16 @@ async fn process(channel: Receiver<Message>, number_of_lines: u16) {
                         u32::MAX
                     });
 
-                if !first_loop {
+                // making space so we can scroll up later
+                print!("{}", "\n".repeat(tags.len() - last_gutter_count as usize));
+                if !tags.is_empty() {
                     //             _______________________ move cursor to beginning of line
-                    //            |              _________ move cursor up X lines
-                    //            |             |      ___ clear to end of screen
-                    //            |             |     |
-                    print!("{CSI}\r{CSI}{GUTTER}A{CSI}J");
+                    //            |       ________________ move cursor up X lines
+                    //            |      |       ________ clear to end of screen
+                    //            |      |      |
+                    print!("{CSI}\r{CSI}{}A{CSI}J", tags.len());
                 } else {
-                    first_loop = false;
+                    print!("\r");
                 }
 
                 let samplerate: u32 = match lines_skipped {
@@ -319,35 +343,32 @@ async fn process(channel: Receiver<Message>, number_of_lines: u16) {
                 for line in pending_lines.iter() {
                     println!("{line}");
                 }
-                let count = u32::try_from(pending_lines.len())
-                    .expect("line count is impossibly high")
-                    + lines_skipped;
                 pending_lines.clear();
                 lines_skipped = 0;
 
-                instant_rate.add_measurement(time_passed, count);
-                fast_rate.add_measurement(time_passed, count);
-                slow_rate.add_measurement(time_passed, count);
-                smooth_rate.add_measurement(time_passed, count);
-
-                print!(
-                    r#"
-Output sampled at {}%
-smooth:    {:6.1} msg/s
-slow-ring: {:6.1} msg/s
-fast-ring: {:6.1} msg/s
-instant:   {:6.1} msg/s"#,
-                    samplerate,
-                    instant_rate.get_speed(),
-                    fast_rate.get_speed(),
-                    slow_rate.get_speed(),
-                    smooth_rate.get_speed()
-                );
+                let mut toflush = format!("-- Output sampled at {}%", samplerate);
+                let maxtagname = tags.iter().map(|x| x.tag.len()).max().unwrap_or(0); // if we have no tags we don't care about the answer
+                for tagmap in tags.iter_mut() {
+                    tagmap.slow.add_measurement(time_passed, tagmap.pending);
+                    tagmap.smooth.add_measurement(time_passed, tagmap.pending);
+                    tagmap.instant.add_measurement(time_passed, tagmap.pending);
+                    tagmap.pending = 0;
+                    let padded_tag =
+                        tagmap.tag.clone() + &" ".repeat(maxtagname - tagmap.tag.len());
+                    toflush += &format!(
+                        "\n-- {padded_tag} {:7.1} {:7.1} {:7.1} req/s",
+                        tagmap.instant.get_speed(),
+                        tagmap.slow.get_speed(),
+                        tagmap.smooth.get_speed()
+                    );
+                }
+                print!("{}", toflush);
                 std::io::stdout().flush().unwrap();
                 if std::time::Instant::now().duration_since(start).as_secs() > 15 {
                     println!("\nExiting after 10 seconds");
                     break;
                 }
+                last_gutter_count = tags.len() as u32;
             }
         }
     }
@@ -369,6 +390,11 @@ fn speedtest() {
     );
 }
 
+const TAGGER_AUTO: &str = "auto";
+const TAGGER_FILENAME: &str = "filename";
+const TAGGER_STATUSCODE: &str = "statuscode";
+const TAGGER_STATUSCODE2: &str = "status_code";
+
 #[derive(Debug)]
 enum Tagger {
     Auto,
@@ -381,10 +407,10 @@ impl FromStr for Tagger {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "auto" => Ok(Tagger::Auto),
-            "filename" => Ok(Tagger::ByFilename),
-            "status" => Ok(Tagger::ByStatusCode),
-            "statuscode" => Ok(Tagger::ByStatusCode),
+            TAGGER_AUTO => Ok(Tagger::Auto),
+            TAGGER_FILENAME => Ok(Tagger::ByFilename),
+            TAGGER_STATUSCODE => Ok(Tagger::ByStatusCode),
+            TAGGER_STATUSCODE2 => Ok(Tagger::ByStatusCode),
             _ => Err(format!("Unknown tagger {s}")),
         }
     }
@@ -425,19 +451,23 @@ fn main() {
         log_dirs.push("/var/log/nginx/".into());
     }
 
-    let number_of_lines: u16 = pargs.value_from_str("--lines").unwrap_or_else(|_| {
+    let number_of_lines: u16 = pargs.value_from_str("--screenheight").unwrap_or_else(|_| {
         use rustix::termios::tcgetwinsize;
-        if let Ok(winsize) = tcgetwinsize(std::io::stderr()) {
-            // we subtract 2 lines so that the oldest line
-            // on the screen is from the previous run
-            if winsize.ws_row > GUTTER + 2 {
-                return winsize.ws_row - GUTTER - 2;
-            }
+        match tcgetwinsize(std::io::stderr()) {
+            Ok(x) => x.ws_row,
+            _ => 3,
         }
-        3
     });
 
     let tagger: Tagger = pargs.value_from_str("--tagger").unwrap_or(Tagger::Auto);
+
+    if let Ok(unknown) = pargs.value_from_str::<&str, String>("--tagger") {
+        eprintln!(
+            "Unknown tagger {}. Valid choices: {} {} {}",
+            unknown, TAGGER_AUTO, TAGGER_FILENAME, TAGGER_STATUSCODE
+        );
+        std::process::exit(2);
+    }
 
     let args = AppArgs {
         fast_generator: pargs.contains("--fast"),
@@ -475,7 +505,7 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
                 Tagger::ByFilename => smol::spawn(follow_tag_filename(
                     sender.clone(),
                     log_file.clone(),
-                    log_file.file_name().unwrap().to_string_lossy().to_string(),
+                    log_file.to_string_lossy().to_string(),
                 ))
                 .detach(),
                 Tagger::ByStatusCode => {
@@ -547,8 +577,7 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use crate::Message;
-    use crate::Tagger;
-    use crate::follow;
+    use crate::follow_tag_filename;
     use smol::LocalExecutor;
     use smol::Timer;
     use smol::future;
@@ -566,11 +595,10 @@ mod tests {
             file.write_all(b"line 2\n").unwrap();
 
             let (sender, receiver) = smol::channel::bounded(10000);
-            smol::spawn(follow(
+            smol::spawn(follow_tag_filename(
                 sender,
                 "/tmp/access.log".into(),
                 "/tmp/access.log".to_owned(),
-                Tagger::Auto,
             ))
             .detach();
 
@@ -588,7 +616,10 @@ mod tests {
             Timer::after(Duration::from_millis(70)).await;
             assert_eq!(
                 receiver.try_recv().unwrap(),
-                Message::Line("line 3".to_owned())
+                Message::Line {
+                    text: "line 3".to_owned(),
+                    tag: "/tmp/access.log".to_owned()
+                },
             );
 
             // One line written in 2 separate parts
@@ -607,7 +638,10 @@ mod tests {
             Timer::after(Duration::from_millis(70)).await;
             assert_eq!(
                 receiver.try_recv().unwrap(),
-                Message::Line("line 4... and a bit".to_owned())
+                Message::Line {
+                    text: "line 4... and a bit".to_owned(),
+                    tag: "/tmp/access.log".to_owned()
+                },
             );
 
             // Two lines written at once
@@ -615,11 +649,17 @@ mod tests {
             Timer::after(Duration::from_millis(70)).await;
             assert_eq!(
                 receiver.try_recv().unwrap(),
-                Message::Line("line 5".to_owned())
+                Message::Line {
+                    text: "line 5".to_owned(),
+                    tag: "/tmp/access.log".to_owned()
+                },
             );
             assert_eq!(
                 receiver.try_recv().unwrap(),
-                Message::Line("line 6".to_owned())
+                Message::Line {
+                    text: "line 6".to_owned(),
+                    tag: "/tmp/access.log".to_owned()
+                }
             );
 
             // Three and a half lines at once
@@ -627,15 +667,24 @@ mod tests {
             Timer::after(Duration::from_millis(70)).await;
             assert_eq!(
                 receiver.try_recv().unwrap(),
-                Message::Line("line 7".to_owned())
+                Message::Line {
+                    text: "line 7".to_owned(),
+                    tag: "/tmp/access.log".to_owned()
+                },
             );
             assert_eq!(
                 receiver.try_recv().unwrap(),
-                Message::Line("line 8".to_owned())
+                Message::Line {
+                    text: "line 8".to_owned(),
+                    tag: "/tmp/access.log".to_owned()
+                },
             );
             assert_eq!(
                 receiver.try_recv().unwrap(),
-                Message::Line("line 9".to_owned())
+                Message::Line {
+                    text: "line 9".to_owned(),
+                    tag: "/tmp/access.log".to_owned()
+                },
             );
             assert!(receiver.try_recv().is_err());
         }));
