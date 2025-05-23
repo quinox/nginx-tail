@@ -4,14 +4,10 @@ cd "$(dirname "$0")"
 source helpers/helperhelper.sh
 
 
-test_build() {
-    banner "cargo build"
-    cargo build
-}
-
 test_clippy() {
     banner "cargo clippy"
     cargo clippy -- --deny warnings
+    cargo clippy --release -- --deny warnings
 }
 
 test_fmt() {
@@ -57,10 +53,6 @@ test_all() {
 
 	echo ""
 	test_clippy
-
-	# Redundant since clippy also builds?
-	echo ""
-	test_build
 
 	echo ""
 	test_fmt
