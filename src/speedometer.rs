@@ -5,14 +5,14 @@ use std::collections::VecDeque;
 // Speedometer trait
 pub trait Speedometer {
     /// Get the current speed in messages per second.
-    fn get_speed(&self) -> f64;
+    fn get_speed(&self) -> f32;
     /// Add a measurement to the speedometer.
     /// The duration is in milliseconds and the number of messages is the number of messages processed in that duration.
-    fn add_measurement(&mut self, duration: u128, msgs: u128);
+    fn add_measurement(&mut self, duration: u32, msgs: u32);
 }
 
 pub struct InstantSpeedometer {
-    speed: f64,
+    speed: f32,
 }
 impl InstantSpeedometer {
     pub fn new() -> Self {
@@ -26,23 +26,23 @@ impl Default for InstantSpeedometer {
 }
 impl InstantSpeedometer {
     /// Get the current speed in messages per second.
-    pub fn get_speed(&self) -> f64 {
+    pub fn get_speed(&self) -> f32 {
         self.speed
     }
 }
 impl Speedometer for InstantSpeedometer {
-    fn get_speed(&self) -> f64 {
+    fn get_speed(&self) -> f32 {
         self.speed
     }
 
-    fn add_measurement(&mut self, duration: u128, msgs: u128) {
-        self.speed = msgs as f64 * 1000.0 / duration as f64;
+    fn add_measurement(&mut self, duration: u32, msgs: u32) {
+        self.speed = msgs as f32 * 1000.0 / duration as f32;
     }
 }
 
 struct RingbufferMeasurement {
-    duration: u128,
-    msgs: u128,
+    duration: u32,
+    msgs: u32,
 }
 pub struct RingbufferSpeedometer {
     measurements: VecDeque<RingbufferMeasurement>,
@@ -62,20 +62,20 @@ impl RingbufferSpeedometer {
     }
 }
 impl Speedometer for RingbufferSpeedometer {
-    fn get_speed(&self) -> f64 {
+    fn get_speed(&self) -> f32 {
         if self.measurements.is_empty() {
             return 0.0;
         }
         let (time, msgs) = self
             .measurements
             .iter()
-            .fold((0_u128, 0_u128), |state, elem| {
+            .fold((0_u32, 0_u32), |state, elem| {
                 (state.0 + elem.duration, state.1 + elem.msgs)
             });
-        msgs as f64 * 1000.0 / (time as f64)
+        msgs as f32 * 1000.0 / (time as f32)
     }
 
-    fn add_measurement(&mut self, duration: u128, msgs: u128) {
+    fn add_measurement(&mut self, duration: u32, msgs: u32) {
         if self.measurements.len() == self.measurements.capacity() {
             let _ = self.measurements.pop_front();
         }
@@ -85,8 +85,8 @@ impl Speedometer for RingbufferSpeedometer {
 }
 
 pub struct SmootherSpeedometer {
-    speed: f64,
-    smooth_factor: f64,
+    speed: f32,
+    smooth_factor: f32,
 }
 impl Default for SmootherSpeedometer {
     fn default() -> Self {
@@ -94,7 +94,7 @@ impl Default for SmootherSpeedometer {
     }
 }
 impl SmootherSpeedometer {
-    pub fn new(smooth_factor: f64) -> Self {
+    pub fn new(smooth_factor: f32) -> Self {
         Self {
             speed: 0.0,
             smooth_factor,
@@ -102,12 +102,12 @@ impl SmootherSpeedometer {
     }
 }
 impl Speedometer for SmootherSpeedometer {
-    fn get_speed(&self) -> f64 {
+    fn get_speed(&self) -> f32 {
         self.speed
     }
 
-    fn add_measurement(&mut self, duration: u128, msgs: u128) {
-        let new_speed = msgs as f64 * 1000.0 / duration as f64;
+    fn add_measurement(&mut self, duration: u32, msgs: u32) {
+        let new_speed = msgs as f32 * 1000.0 / duration as f32;
         self.speed = self.smooth_factor * new_speed + (1.0 - self.smooth_factor) * self.speed;
     }
 }

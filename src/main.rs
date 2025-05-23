@@ -22,6 +22,8 @@ const HELP: &str = r#"
         -h, --help         Show this help message
 "#;
 
+const GUTTER: u16 = 5;
+
 #[derive(Debug)]
 struct AppArgs {
     log_dirs: Vec<std::path::PathBuf>,
@@ -30,7 +32,7 @@ struct AppArgs {
     fast_generator: bool,
     #[cfg(debug_assertions)]
     slow_generator: bool,
-    number_of_lines: u64,
+    number_of_lines: u16,
 }
 
 fn parse_path(s: &std::ffi::OsStr) -> Result<std::path::PathBuf, &'static str> {
@@ -170,7 +172,7 @@ async fn fake_fast(channel: SenderChannel) {
 // https://en.wikipedia.org/wiki/ANSI_escape_code#CSI_(Control_Sequence_Introducer)_sequences
 const CSI: &str = "\x1b[";
 
-async fn process(channel: Receiver<Message>, number_of_lines: u64) {
+async fn process(channel: Receiver<Message>, number_of_lines: u16) {
     let mut instant_rate = InstantSpeedometer::new();
     let mut fast_rate = RingbufferSpeedometer::new(2 << 1);
     let mut slow_rate = RingbufferSpeedometer::new(2 << 8);
@@ -178,10 +180,9 @@ async fn process(channel: Receiver<Message>, number_of_lines: u64) {
     let start = std::time::Instant::now();
 
     let mut pending_lines: VecDeque<String> = VecDeque::with_capacity(number_of_lines as usize);
-    let mut lines_skipped: i64 = 0;
-    let gutter = 5;
+    let mut lines_skipped: u32 = 0;
 
-    print!("{}", "\n".repeat(gutter)); // making space so we can scroll up later
+    print!("{}", "\n".repeat(GUTTER.into())); // making space so we can scroll up later
     loop {
         match channel.recv().await {
             Err(_) => {
@@ -189,7 +190,7 @@ async fn process(channel: Receiver<Message>, number_of_lines: u64) {
                 return;
             }
             Ok(Message::Line(line)) => {
-                if pending_lines.len() as u64 >= number_of_lines {
+                if pending_lines.len() >= number_of_lines.into() {
                     pending_lines.pop_front();
                     lines_skipped += 1;
                 };
@@ -198,31 +199,37 @@ async fn process(channel: Receiver<Message>, number_of_lines: u64) {
             Ok(Message::Print) => {
                 let last_timestamp = std::time::Instant::now();
                 Timer::after(Duration::from_secs(1)).await;
-                let time_passed = std::time::Instant::now()
+                let time_passed: u32 = std::time::Instant::now()
                     .duration_since(last_timestamp)
-                    .as_millis();
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or_else(|_| {
+                        eprintln!("An incredible amount of time passed!");
+                        u32::MAX
+                    });
 
                 //             _______________________ move cursor to beginning of line
                 //            |              _________ move cursor up X lines
                 //            |             |      ___ clear to end of screen
                 //            |             |     |
-                print!("{CSI}\r{CSI}{gutter}A{CSI}J");
+                print!("{CSI}\r{CSI}{GUTTER}A{CSI}J");
 
-                let samplerate: i64 = match lines_skipped {
+                let samplerate: u32 = match lines_skipped {
                     0 => 100,
                     _ => {
-                        (100 * pending_lines.len() as i64)
-                            / (lines_skipped + pending_lines.len() as i64)
+                        (100 * pending_lines.len() as u32)
+                            / (lines_skipped + pending_lines.len() as u32)
                     }
                 };
                 for line in pending_lines.iter() {
                     println!("{line}");
                 }
+                let count = u32::try_from(pending_lines.len())
+                    .expect("line count is impossibly high")
+                    + lines_skipped;
                 pending_lines.clear();
                 lines_skipped = 0;
 
-                let count =
-                    u128::try_from(pending_lines.len()).expect("line count is impossibly high");
                 instant_rate.add_measurement(time_passed, count);
                 fast_rate.add_measurement(time_passed, count);
                 slow_rate.add_measurement(time_passed, count);
@@ -301,7 +308,17 @@ fn main() {
         log_files.push(log_file);
     }
 
-    let number_of_lines: u64 = pargs.value_from_str("--lines").unwrap_or(3);
+    let number_of_lines: u16 = pargs.value_from_str("--lines").unwrap_or_else(|_| {
+        use rustix::termios::tcgetwinsize;
+        if let Ok(winsize) = tcgetwinsize(std::io::stderr()) {
+            // we subtract 2 lines so that the oldest line
+            // on the screen is from the previous run
+            if winsize.ws_row > GUTTER + 2 {
+                return winsize.ws_row - GUTTER - 2;
+            }
+        }
+        3
+    });
 
     let args = AppArgs {
         fast_generator: pargs.contains("--fast"),
@@ -361,9 +378,7 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
 
         match read_dir(dir_to_check.clone()).await {
             Err(e) => {
-                println!(
-                    "WARNING: Failed to read directory {dir_to_check:?}: {e}"
-                );
+                println!("WARNING: Failed to read directory {dir_to_check:?}: {e}");
                 continue;
             }
             Ok(mut entries) => {
