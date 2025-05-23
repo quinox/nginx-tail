@@ -470,7 +470,9 @@ fn main() {
     }
 
     let args = AppArgs {
+        #[cfg(debug_assertions)]
         fast_generator: pargs.contains("--fast"),
+        #[cfg(debug_assertions)]
         slow_generator: pargs.contains("--slow"),
         log_dirs,
         log_files,
