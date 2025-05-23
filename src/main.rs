@@ -2,6 +2,7 @@ use nginx_top::InstantSpeedometer;
 use nginx_top::RingbufferSpeedometer;
 use nginx_top::SmootherSpeedometer;
 use nginx_top::Speedometer;
+use smol::fs::File;
 use smol::io::AsyncReadExt as _;
 use smol::io::AsyncSeekExt as _;
 use smol::{
@@ -10,8 +11,11 @@ use smol::{
     fs::read_dir,
     stream::StreamExt,
 };
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io::Write as _;
+use std::str::FromStr;
+use std::vec;
 use std::{fmt::Display, path::PathBuf, time::Duration};
 
 const HELP: &str = r#"
@@ -33,6 +37,7 @@ struct AppArgs {
     #[cfg(debug_assertions)]
     slow_generator: bool,
     number_of_lines: u16,
+    tagger: Tagger,
 }
 
 fn parse_path(s: &std::ffi::OsStr) -> Result<std::path::PathBuf, &'static str> {
@@ -59,41 +64,42 @@ impl Display for Error {
 
 type SenderChannel = Sender<Message>;
 
-async fn follow(file: PathBuf, channel: SenderChannel) {
-    let mut file = smol::fs::File::open(&file).await.unwrap();
-    // Seek to the end of the file
-    println!("Following file {file:?}");
-    if file.seek(std::io::SeekFrom::End(0)).await.is_err() {
-        eprintln!("Error seeking to end of file {file:?}");
-        return;
+struct LineReader<'a> {
+    file: &'a mut File,
+    pending: Vec<u8>,
+    readbuf: Vec<u8>,
+}
+
+impl<'a> LineReader<'a> {
+    fn new(file: &'a mut File) -> Self {
+        LineReader {
+            file,
+            pending: vec![],
+            readbuf: vec![0; 1024],
+        }
     }
-    let mut pending = vec![];
-    let mut readbuf = vec![0; 1024];
-    loop {
-        match file.read(&mut readbuf).await {
-            Ok(0) => {
-                // EOF, at least for now
-                Timer::after(Duration::from_millis(50)).await;
-            }
+    async fn read_lines(&mut self) -> Result<Vec<String>, ()> {
+        match self.file.read(&mut self.readbuf).await {
+            Ok(0) => Ok(vec![]),
             Ok(n) => {
                 // newline in the data we just read?
-                if let Some(first_newline) = readbuf.iter().position(|x| *x == b'\n') {
+                if let Some(first_newline) = self.readbuf.iter().position(|x| *x == b'\n') {
+                    let mut whole_lines = vec![];
                     // There was! Let's process the entire block of text we have now
-                    let uninterrupted_slice = &[&pending, &readbuf[..n]].concat();
+                    let uninterrupted_slice = &[&self.pending, &self.readbuf[..n]].concat();
 
                     let mut starting_pointer = 0;
-                    let mut ending_pointer = pending.len() + first_newline;
+                    let mut ending_pointer = self.pending.len() + first_newline;
                     // slightly peculiar loop instead of a more common `if let()`
                     // because we already know we have at least one line to process
                     loop {
-                        let line = String::from_utf8_lossy(
-                            &uninterrupted_slice[starting_pointer..ending_pointer],
-                        )
-                        .to_string();
-                        if channel.send(Message::Line(line)).await.is_err() {
-                            // Channel closed
-                            return;
-                        }
+                        whole_lines.push(
+                            String::from_utf8_lossy(
+                                &uninterrupted_slice[starting_pointer..ending_pointer],
+                            )
+                            .to_string(),
+                        );
+
                         starting_pointer = ending_pointer + 1;
                         match uninterrupted_slice[starting_pointer..]
                             .iter()
@@ -103,15 +109,93 @@ async fn follow(file: PathBuf, channel: SenderChannel) {
                             Some(x) => ending_pointer += x + 1,
                         }
                     }
-                    pending.clear();
-                    pending.extend_from_slice(&uninterrupted_slice[starting_pointer..]);
+                    self.pending.clear();
+                    self.pending
+                        .extend_from_slice(&uninterrupted_slice[starting_pointer..]);
+                    Ok(whole_lines)
                 } else {
                     // No newline this time; we'll have to keep the data around for next time
-                    pending.extend_from_slice(&readbuf[..n]);
+                    self.pending.extend_from_slice(&self.readbuf[..n]);
+                    Ok(vec![])
                 }
             }
-            Err(e) => {
-                eprintln!("Error reading file {file:?}: {e}");
+            Err(_) => Err(()),
+        }
+    }
+}
+
+async fn follow_tag_filename(channel: SenderChannel, file: PathBuf, filename: String) {
+    let mut file = smol::fs::File::open(&file).await.unwrap();
+    // Seek to the end of the file
+    println!("Following file {file:?}");
+    if file.seek(std::io::SeekFrom::End(0)).await.is_err() {
+        eprintln!("Error seeking to end of file {file:?}");
+        return;
+    }
+    let mut processor = LineReader::new(&mut file);
+    loop {
+        match processor.read_lines().await {
+            Ok(lines) => {
+                if lines.len() == 0 {
+                    // EOF, at least for now
+                    Timer::after(Duration::from_millis(50)).await;
+                    continue;
+                }
+                for line in lines {
+                    if channel
+                        .send(Message::Line {
+                            text: line,
+                            tag: filename.clone(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        // Channel closed
+                        return;
+                    }
+                }
+            }
+            Err(_) => {
+                eprintln!("File {filename} is no longer readable");
+                return;
+            }
+        }
+    }
+}
+
+async fn follow_tag_statuscode(channel: SenderChannel, file: PathBuf) {
+    let mut file = smol::fs::File::open(&file).await.unwrap();
+    // Seek to the end of the file
+    println!("Following file {file:?}");
+    if file.seek(std::io::SeekFrom::End(0)).await.is_err() {
+        eprintln!("Error seeking to end of file {file:?}");
+        return;
+    }
+    let mut processor = LineReader::new(&mut file);
+    loop {
+        match processor.read_lines().await {
+            Ok(lines) => {
+                if lines.len() == 0 {
+                    // EOF, at least for now
+                    Timer::after(Duration::from_millis(50)).await;
+                    continue;
+                }
+                for line in lines {
+                    if channel
+                        .send(Message::Line {
+                            text: line,
+                            tag: "418".to_owned(), // 418 I'm a teapot
+                        })
+                        .await
+                        .is_err()
+                    {
+                        // Channel closed
+                        return;
+                    }
+                }
+            }
+            Err(_) => {
+                eprintln!("File is no longer readable");
                 return;
             }
         }
@@ -121,7 +205,7 @@ async fn follow(file: PathBuf, channel: SenderChannel) {
 #[derive(Debug, PartialEq)]
 enum Message {
     Print,
-    Line(String),
+    Line { text: String, tag: String },
 }
 async fn periodic_print(channel: SenderChannel) {
     loop {
@@ -139,7 +223,10 @@ async fn fake_slow(channel: SenderChannel) {
     loop {
         Timer::after(Duration::from_secs(2)).await;
         match channel
-            .send(Message::Line("Fake slow msg".to_string()))
+            .send(Message::Line {
+                text: "Fake slow msg".to_string(),
+                tag: "fastfake".to_owned(),
+            })
             .await
         {
             Ok(_) => {}
@@ -156,7 +243,10 @@ async fn fake_fast(channel: SenderChannel) {
         Timer::after(Duration::from_millis(100)).await;
         for i in 0..100 {
             match channel
-                .send(Message::Line(format!("Fake fast msg {i}")))
+                .send(Message::Line {
+                    text: format!("Fake fast msg {i}"),
+                    tag: "fakefast".to_owned(),
+                })
                 .await
             {
                 Ok(_) => {}
@@ -190,12 +280,12 @@ async fn process(channel: Receiver<Message>, number_of_lines: u16) {
                 eprintln!("Channel closed.");
                 return;
             }
-            Ok(Message::Line(line)) => {
+            Ok(Message::Line { text, tag: _tag }) => {
                 if pending_lines.len() >= number_of_lines.into() {
                     pending_lines.pop_front();
                     lines_skipped += 1;
                 };
-                pending_lines.push_back(line);
+                pending_lines.push_back(text);
             }
             Ok(Message::Print) => {
                 let last_timestamp = std::time::Instant::now();
@@ -279,6 +369,27 @@ fn speedtest() {
     );
 }
 
+#[derive(Debug)]
+enum Tagger {
+    Auto,
+    ByFilename,
+    ByStatusCode,
+}
+
+impl FromStr for Tagger {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(Tagger::Auto),
+            "filename" => Ok(Tagger::ByFilename),
+            "status" => Ok(Tagger::ByStatusCode),
+            "statuscode" => Ok(Tagger::ByStatusCode),
+            _ => Err(format!("Unknown tagger {s}")),
+        }
+    }
+}
+
 fn main() {
     let mut pargs = pico_args::Arguments::from_env();
     if pargs.contains(["-h", "--help"]) {
@@ -326,12 +437,15 @@ fn main() {
         3
     });
 
+    let tagger: Tagger = pargs.value_from_str("--tagger").unwrap_or(Tagger::Auto);
+
     let args = AppArgs {
         fast_generator: pargs.contains("--fast"),
         slow_generator: pargs.contains("--slow"),
         log_dirs,
         log_files,
         number_of_lines,
+        tagger,
     };
 
     let remaining = pargs.finish();
@@ -357,7 +471,18 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
             // but at least we tried our best
             eprintln!("WARNING: Log file {log_file:?} is not a file");
         } else {
-            smol::spawn(follow(log_file, sender.clone())).detach();
+            match args.tagger {
+                Tagger::ByFilename => smol::spawn(follow_tag_filename(
+                    sender.clone(),
+                    log_file.clone(),
+                    log_file.file_name().unwrap().to_string_lossy().to_string(),
+                ))
+                .detach(),
+                Tagger::ByStatusCode => {
+                    smol::spawn(follow_tag_statuscode(sender.clone(), log_file)).detach()
+                }
+                _ => todo!(),
+            };
             senders += 1;
         }
     }
@@ -396,7 +521,12 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
                         && (entry.file_name() == "access.log" || entry.file_name() == "error.log")
                     {
                         println!("Added {:?} as reader", entry.path());
-                        smol::spawn(follow(entry.path(), sender.clone())).detach();
+                        smol::spawn(follow_tag_filename(
+                            sender.clone(),
+                            entry.path(),
+                            entry.file_name().to_string_lossy().to_string(),
+                        ))
+                        .detach();
                         senders += 1;
                     }
                 }
@@ -417,6 +547,7 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use crate::Message;
+    use crate::Tagger;
     use crate::follow;
     use smol::LocalExecutor;
     use smol::Timer;
@@ -435,7 +566,13 @@ mod tests {
             file.write_all(b"line 2\n").unwrap();
 
             let (sender, receiver) = smol::channel::bounded(10000);
-            smol::spawn(follow("/tmp/access.log".into(), sender)).detach();
+            smol::spawn(follow(
+                sender,
+                "/tmp/access.log".into(),
+                "/tmp/access.log".to_owned(),
+                Tagger::Auto,
+            ))
+            .detach();
 
             // No data written yet
             Timer::after(Duration::from_millis(70)).await;
