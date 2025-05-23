@@ -127,9 +127,9 @@ mod tests {
         speedometer.add_measurement(1000, 0);
         assert_eq!(speedometer.get_speed(), 32.0);
         speedometer.add_measurement(1000, 0);
-        assert_eq!(speedometer.get_speed(), 17.777777777777778);
+        assert_eq!(speedometer.get_speed(), 17.777_779);
         speedometer.add_measurement(1000, 0);
-        assert_eq!(speedometer.get_speed(), 9.523809523809524);
+        assert_eq!(speedometer.get_speed(), 9.523_809);
         speedometer.add_measurement(1000, 0);
         assert_eq!(speedometer.get_speed(), 0.0);
         speedometer.add_measurement(1000, 0);
@@ -174,8 +174,8 @@ mod tests {
         speedometer.add_measurement(1000, 0);
         assert_eq!(speedometer.get_speed(), 0.48828125);
         speedometer.add_measurement(1000, 0);
-        assert_eq!(speedometer.get_speed(), 0.244140625);
+        assert_eq!(speedometer.get_speed(), 0.244_140_63);
         speedometer.add_measurement(1000, 0);
-        assert_eq!(speedometer.get_speed(), 0.1220703125);
+        assert_eq!(speedometer.get_speed(), 0.122_070_31);
     }
 }
