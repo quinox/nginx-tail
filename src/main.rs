@@ -182,7 +182,8 @@ async fn process(channel: Receiver<Message>, number_of_lines: u16) {
     let mut pending_lines: VecDeque<String> = VecDeque::with_capacity(number_of_lines as usize);
     let mut lines_skipped: u32 = 0;
 
-    print!("{}", "\n".repeat(GUTTER.into())); // making space so we can scroll up later
+    // print!("{}", "\n".repeat(GUTTER.into())); // making space so we can scroll up later
+    let mut first_loop = true;
     loop {
         match channel.recv().await {
             Err(_) => {
@@ -208,11 +209,15 @@ async fn process(channel: Receiver<Message>, number_of_lines: u16) {
                         u32::MAX
                     });
 
-                //             _______________________ move cursor to beginning of line
-                //            |              _________ move cursor up X lines
-                //            |             |      ___ clear to end of screen
-                //            |             |     |
-                print!("{CSI}\r{CSI}{GUTTER}A{CSI}J");
+                if !first_loop {
+                    //             _______________________ move cursor to beginning of line
+                    //            |              _________ move cursor up X lines
+                    //            |             |      ___ clear to end of screen
+                    //            |             |     |
+                    print!("{CSI}\r{CSI}{GUTTER}A{CSI}J");
+                } else {
+                    first_loop = false;
+                }
 
                 let samplerate: u32 = match lines_skipped {
                     0 => 100,
@@ -296,9 +301,6 @@ fn main() {
         }
         log_dirs.push(log_dir);
     }
-    if log_dirs.is_empty() {
-        log_dirs.push("/var/log/nginx/".into());
-    }
 
     let mut log_files = vec![];
     while let Some(log_file) = pargs
@@ -306,6 +308,10 @@ fn main() {
         .unwrap()
     {
         log_files.push(log_file);
+    }
+
+    if log_files.is_empty() && log_dirs.is_empty() {
+        log_dirs.push("/var/log/nginx/".into());
     }
 
     let number_of_lines: u16 = pargs.value_from_str("--lines").unwrap_or_else(|_| {
