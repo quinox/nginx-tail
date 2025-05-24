@@ -2,7 +2,10 @@ use nginx_top::InstantSpeedometer;
 use nginx_top::RingbufferSpeedometer;
 use nginx_top::SmootherSpeedometer;
 use nginx_top::Speedometer;
+use smol::LocalExecutor;
+use smol::channel::SendError;
 use smol::fs::File;
+use smol::future;
 use smol::io::AsyncReadExt as _;
 use smol::io::AsyncSeekExt as _;
 use smol::{
@@ -22,7 +25,6 @@ const HELP: &str = r#"
         --log-root <path>                    Path to the nginx log directory
         --log-file <file>                    Path to the nginx log file
         --tagger [ filename | status_code ]  How to group the stats
-        -x, --speed-test                     Test your terminal speed
         -h, --help                           Show this help message
 "#;
 
@@ -53,10 +55,15 @@ impl From<String> for Error {
         Error(value)
     }
 }
+impl From<SendError<Message>> for Error {
+    fn from(value: SendError<Message>) -> Self {
+        Error(format!("{value:?}"))
+    }
+}
 
 impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("{}", self.0))
+        f.write_fmt(format_args!("[{}] {}", env!("CARGO_PKG_NAME"), self.0))
     }
 }
 
@@ -77,6 +84,10 @@ impl<'a> LineReader<'a> {
         }
     }
     async fn read_lines(&mut self) -> Result<Vec<String>, ()> {
+        // TODO: the only-look-for-newlines-in-readbuf might be too optimized
+        // for no gain but more complex code. We'll have to do some testing but
+        // perhaps we can simply copy all read data at the end of pending and
+        // then check for newlines: easier and just as fast?
         match self.file.read(&mut self.readbuf).await {
             Ok(0) => Ok(vec![]),
             Ok(n) => {
@@ -125,11 +136,14 @@ impl<'a> LineReader<'a> {
 async fn follow_tag_filename(channel: SenderChannel, file: PathBuf, filename: String) {
     let mut file = smol::fs::File::open(&file).await.unwrap();
     // Seek to the end of the file
-    println!("Following file {file:?}");
     if file.seek(std::io::SeekFrom::End(0)).await.is_err() {
         eprintln!("Error seeking to end of file {file:?}");
         return;
     }
+    channel
+        .send(Message::RegisterTag(filename.clone()))
+        .await
+        .unwrap();
     let mut processor = LineReader::new(&mut file);
     loop {
         match processor.read_lines().await {
@@ -200,19 +214,24 @@ async fn follow_tag_statuscode(channel: SenderChannel, file: PathBuf) {
     }
 }
 
+/// Message to be sent to the processing thread
 #[derive(Debug, PartialEq)]
 enum Message {
-    Print,
+    Print,               // trigger a print
+    RegisterTag(String), // optional; can be used when you know upfront what the tags are
     Line { text: String, tag: String },
 }
-async fn periodic_print(channel: SenderChannel) {
+async fn periodic_print(channel: SenderChannel) -> Result<(), Error> {
+    // update GUI right away
+    channel.send(Message::Print).await?;
+    Timer::after(Duration::from_millis(100)).await;
+    channel.send(Message::Print).await?;
+    Timer::after(Duration::from_millis(200)).await;
+    channel.send(Message::Print).await?;
+    Timer::after(Duration::from_millis(300)).await;
     loop {
-        match channel.send(Message::Print).await {
-            Ok(_) => {
-                Timer::after(Duration::from_millis(1000)).await;
-            }
-            Err(_) => return,
-        }
+        channel.send(Message::Print).await?;
+        Timer::after(Duration::from_millis(1000)).await;
     }
 }
 
@@ -261,22 +280,68 @@ async fn fake_fast(channel: SenderChannel) {
 // https://en.wikipedia.org/wiki/ANSI_escape_code#CSI_(Control_Sequence_Introducer)_sequences
 const CSI: &str = "\x1b[";
 
-struct TagMap {
+struct TagStats {
     tag: String,
-    pending: u32,
-    instant: InstantSpeedometer,
-    slow: RingbufferSpeedometer,
-    smooth: SmootherSpeedometer,
+    start: std::time::Instant,
+    pending: u32,                // pending since start
+    instant: InstantSpeedometer, // processed before start
+    slow: RingbufferSpeedometer, // processed before start
+    smooth: SmootherSpeedometer, // processed before start
 }
-impl TagMap {
+impl TagStats {
     fn new(tag: String) -> Self {
         Self {
             tag,
+            start: std::time::Instant::now(),
             pending: 0,
             instant: InstantSpeedometer::new(),
             slow: RingbufferSpeedometer::new(2 << 8),
             smooth: SmootherSpeedometer::new(0.2),
         }
+    }
+    /// Update the speedometers
+    fn process(&mut self) {
+        let elapsed = self.start.elapsed().as_millis() as u32;
+        if elapsed == 0 {
+            return;
+        }
+        self.slow.add_measurement(elapsed, self.pending);
+        self.smooth.add_measurement(elapsed, self.pending);
+        self.instant.add_measurement(elapsed, self.pending);
+        self.start = std::time::Instant::now();
+        self.pending = 0;
+    }
+}
+
+struct TagMap(Vec<TagStats>);
+impl TagMap {
+    fn new() -> Self {
+        Self(vec![])
+    }
+    fn get_or_create(&mut self, tag: String) -> &mut TagStats {
+        // we only max ~5 tags so looping is faster than a hashmap
+        if let Some(index) = self.0.iter().position(|x| x.tag == tag) {
+            &mut self.0[index]
+        } else {
+            self.0.push(TagStats::new(tag));
+            self.0.last_mut().unwrap()
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn iter(&mut self) -> impl Iterator<Item = &TagStats> {
+        self.0.iter()
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut TagStats> {
+        self.0.iter_mut()
     }
 }
 
@@ -284,15 +349,18 @@ async fn process(channel: Receiver<Message>, screenheight: u16) {
     let start = std::time::Instant::now();
     let mut pending_lines: VecDeque<String> = VecDeque::with_capacity(screenheight as usize);
     let mut lines_skipped: u32 = 0;
-    let mut tags: Vec<TagMap> = vec![]; // in order of printing
+    let mut tags = TagMap::new();
     let mut last_gutter_count: u32 = 0;
 
     loop {
-        let number_of_lines = screenheight - tags.len() as u16 - 2; // we'll try to show the last output line of last time at the top 
+        let number_of_lines = screenheight - tags.len() as u16 - 2; // we'll try to show the last output line of last time at the top
         match channel.recv().await {
             Err(_) => {
                 eprintln!("Channel closed.");
                 return;
+            }
+            Ok(Message::RegisterTag(tag)) => {
+                let _ = tags.get_or_create(tag);
             }
             Ok(Message::Line { text, tag }) => {
                 if pending_lines.len() >= number_of_lines.into() {
@@ -302,35 +370,21 @@ async fn process(channel: Receiver<Message>, screenheight: u16) {
                 pending_lines.push_back(text);
 
                 // we only expect up to 5 tags so is prolly faster than a hashmap
-                let tagmap = tags.iter_mut().find(|x| x.tag == tag);
-                if let Some(tagmap) = tagmap {
-                    tagmap.pending += 1;
-                } else {
-                    tags.push(TagMap::new(tag));
-                }
+                let tagmap = tags.get_or_create(tag.clone());
+                tagmap.pending += 1;
             }
             Ok(Message::Print) => {
-                let last_timestamp = std::time::Instant::now();
-                Timer::after(Duration::from_secs(1)).await;
-                let time_passed: u32 = std::time::Instant::now()
-                    .duration_since(last_timestamp)
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or_else(|_| {
-                        eprintln!("An incredible amount of time passed!");
-                        u32::MAX
-                    });
-
                 // making space so we can scroll up later
                 print!("{}", "\n".repeat(tags.len() - last_gutter_count as usize));
-                if !tags.is_empty() {
+                if tags.is_empty() {
+                    // using CSI<n>A with n = 0 still moves the cursor up
+                    print!("\r{CSI}J");
+                } else {
                     //             _______________________ move cursor to beginning of line
                     //            |       ________________ move cursor up X lines
                     //            |      |       ________ clear to end of screen
                     //            |      |      |
                     print!("{CSI}\r{CSI}{}A{CSI}J", tags.len());
-                } else {
-                    print!("\r");
                 }
 
                 let samplerate: u32 = match lines_skipped {
@@ -346,13 +400,10 @@ async fn process(channel: Receiver<Message>, screenheight: u16) {
                 pending_lines.clear();
                 lines_skipped = 0;
 
-                let mut toflush = format!("-- Output sampled at {}%", samplerate);
+                let mut toflush = format!("-- Output sampled at {samplerate}%");
                 let maxtagname = tags.iter().map(|x| x.tag.len()).max().unwrap_or(0); // if we have no tags we don't care about the answer
                 for tagmap in tags.iter_mut() {
-                    tagmap.slow.add_measurement(time_passed, tagmap.pending);
-                    tagmap.smooth.add_measurement(time_passed, tagmap.pending);
-                    tagmap.instant.add_measurement(time_passed, tagmap.pending);
-                    tagmap.pending = 0;
+                    tagmap.process();
                     let padded_tag =
                         tagmap.tag.clone() + &" ".repeat(maxtagname - tagmap.tag.len());
                     toflush += &format!(
@@ -372,22 +423,6 @@ async fn process(channel: Receiver<Message>, screenheight: u16) {
             }
         }
     }
-}
-
-fn speedtest() {
-    let start = std::time::Instant::now();
-    let mut lines = 0;
-    let nginx_line = "measuring... ".repeat(20) + "\n";
-    let nginx_line = nginx_line.as_bytes();
-    while std::time::Instant::now().duration_since(start).as_secs() < 5 {
-        std::io::stdout().write_all(nginx_line).unwrap();
-        std::io::stdout().flush().unwrap();
-        lines += 1;
-    }
-    println!(
-        "Your setup managed to output {} lines per second",
-        lines / std::time::Instant::now().duration_since(start).as_secs()
-    );
 }
 
 const TAGGER_AUTO: &str = "auto";
@@ -420,10 +455,6 @@ fn main() {
     let mut pargs = pico_args::Arguments::from_env();
     if pargs.contains(["-h", "--help"]) {
         println!("{HELP}");
-        std::process::exit(0);
-    }
-    if pargs.contains(["-x", "--speed-test"]) {
-        speedtest();
         std::process::exit(0);
     }
 
@@ -489,13 +520,15 @@ fn main() {
 
     match smol::block_on(innermain(args)) {
         Ok(_) => {}
-        Err(ex) => eprintln!("Runtime failure: {ex}"),
+        Err(ex) => eprintln!("{ex}"),
     }
 }
 
 async fn innermain(args: AppArgs) -> Result<(), Error> {
     let mut senders = 0;
-    let (sender, receiver) = bounded(10000);
+    let (sender, receiver) = bounded(1_000_000);
+
+    let async_exec = LocalExecutor::new();
 
     for log_file in args.log_files {
         if !log_file.is_file() {
@@ -525,12 +558,12 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
     {
         if args.fast_generator {
             println!("Fast generator enabled");
-            smol::spawn(fake_fast(sender.clone())).detach();
+            async_exec.spawn(fake_fast(sender.clone())).detach();
             senders += 1;
         }
         if args.slow_generator {
             println!("Slow generator enabled");
-            smol::spawn(fake_slow(sender.clone())).detach();
+            async_exec.spawn(fake_slow(sender.clone())).detach();
             senders += 1;
         }
     }
@@ -553,12 +586,13 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
                         && (entry.file_name() == "access.log" || entry.file_name() == "error.log")
                     {
                         println!("Added {:?} as reader", entry.path());
-                        smol::spawn(follow_tag_filename(
-                            sender.clone(),
-                            entry.path(),
-                            entry.file_name().to_string_lossy().to_string(),
-                        ))
-                        .detach();
+                        async_exec
+                            .spawn(follow_tag_filename(
+                                sender.clone(),
+                                entry.path(),
+                                entry.file_name().to_string_lossy().to_string(),
+                            ))
+                            .detach();
                         senders += 1;
                     }
                 }
@@ -570,9 +604,10 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
         return Err(Error("No useable log files found".to_string()));
     }
 
-    smol::spawn(periodic_print(sender.clone())).detach();
+    async_exec.spawn(periodic_print(sender.clone())).detach();
 
-    smol::spawn(process(receiver, args.number_of_lines)).await;
+    future::block_on(async_exec.run(process(receiver, args.number_of_lines)));
+
     Ok(())
 }
 
@@ -606,6 +641,11 @@ mod tests {
 
             // No data written yet
             Timer::after(Duration::from_millis(70)).await;
+            assert_eq!(
+                receiver.try_recv().unwrap(),
+                Message::RegisterTag("/tmp/access.log".to_owned())
+            );
+
             let received = receiver.try_recv();
             assert!(
                 received.is_err(),

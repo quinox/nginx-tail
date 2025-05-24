@@ -108,6 +108,16 @@ impl Speedometer for SmootherSpeedometer {
 
     fn add_measurement(&mut self, duration: u32, msgs: u32) {
         let new_speed = msgs as f32 * 1000.0 / duration as f32;
+        // Since we keep calculating with self.speed we have to protect against
+        // ending up in NaN / inf: we won't be abel to  recover from that
+        if new_speed.is_nan() {
+            eprintln!("NaN speed detected");
+            return;
+        }
+        if new_speed.is_infinite() {
+            eprintln!("Infinite speed detected");
+            return;
+        }
         self.speed = self.smooth_factor * new_speed + (1.0 - self.smooth_factor) * self.speed;
     }
 }
