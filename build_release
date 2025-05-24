@@ -1,0 +1,5 @@
+#!/bin/bash
+set -eu
+
+target="x86_64-unknown-linux-musl"  # to make it more compatible with most Ubuntu servers
+exec cargo build --release --target "$target"

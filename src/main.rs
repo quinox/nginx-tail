@@ -1,7 +1,7 @@
-use nginx_top::InstantSpeedometer;
-use nginx_top::RingbufferSpeedometer;
-use nginx_top::SmootherSpeedometer;
-use nginx_top::Speedometer;
+use nginx_tail::InstantSpeedometer;
+use nginx_tail::RingbufferSpeedometer;
+use nginx_tail::SmootherSpeedometer;
+use nginx_tail::Speedometer;
 use smol::LocalExecutor;
 use smol::channel::SendError;
 use smol::fs::File;
@@ -14,6 +14,7 @@ use smol::{
     fs::read_dir,
     stream::StreamExt,
 };
+use std::cmp;
 use std::collections::VecDeque;
 use std::io::Write as _;
 use std::str::FromStr;
@@ -38,6 +39,7 @@ struct AppArgs {
     slow_generator: bool,
     number_of_lines: u16,
     tagger: Tagger,
+    max_runtime: Option<u32>,
 }
 
 fn parse_path(s: &std::ffi::OsStr) -> Result<std::path::PathBuf, &'static str> {
@@ -102,9 +104,24 @@ impl<'a> LineReader<'a> {
                     // slightly peculiar loop instead of a more common `if let()`
                     // because we already know we have at least one line to process
                     loop {
+                        // TODO
+                        // thread 'main' panicked at src/main.rs:108:53:
+                        // range end index 248 out of range for slice of length 220
+                        // stack backtrace:
+                        //    0: __rustc::rust_begin_unwind
+                        //    1: core::panicking::panic_fmt
+                        //    2: core::slice::index::slice_end_index_len_fail::do_panic::runtime
+                        //    3: core::slice::index::slice_end_index_len_fail
+                        //    4: nginx_tail::LineReader::read_lines::{{closure}}
+                        //    5: <async_executor::AsyncCallOnDrop<Fut,Cleanup> as core::future::future::Future>::poll
+                        //    6: async_task::raw::RawTask<F,T,S,M>::run
+                        //    7: <futures_lite::future::Or<F1,F2> as core::future::future::Future>::poll
+                        //    8: std::thread::local::LocalKey<T>::with
+                        //    9: std::thread::local::LocalKey<T>::with
+
                         whole_lines.push(
                             String::from_utf8_lossy(
-                                &uninterrupted_slice[starting_pointer..ending_pointer],
+                                &uninterrupted_slice[starting_pointer..ending_pointer], // <-- this is the problem (line 108)
                             )
                             .to_string(),
                         );
@@ -178,7 +195,6 @@ async fn follow_tag_filename(channel: SenderChannel, file: PathBuf, filename: St
 async fn follow_tag_statuscode(channel: SenderChannel, file: PathBuf) {
     let mut file = smol::fs::File::open(&file).await.unwrap();
     // Seek to the end of the file
-    println!("Following file {file:?}");
     if file.seek(std::io::SeekFrom::End(0)).await.is_err() {
         eprintln!("Error seeking to end of file {file:?}");
         return;
@@ -313,40 +329,90 @@ impl TagStats {
     }
 }
 
-struct TagMap(Vec<TagStats>);
+struct TagMap {
+    stats: Vec<TagStats>,
+    shared_prefix: String,
+    shared_suffix: String,
+}
 impl TagMap {
     fn new() -> Self {
-        Self(vec![])
+        Self {
+            stats: vec![],
+            shared_prefix: "".to_owned(),
+            shared_suffix: "".to_owned(),
+        }
     }
     fn get_or_create(&mut self, tag: String) -> &mut TagStats {
         // we only max ~5 tags so looping is faster than a hashmap
-        if let Some(index) = self.0.iter().position(|x| x.tag == tag) {
-            &mut self.0[index]
+        if let Some(index) = self.stats.iter().position(|x| x.tag == tag) {
+            &mut self.stats[index]
         } else {
-            self.0.push(TagStats::new(tag));
-            self.0.last_mut().unwrap()
+            self.stats.push(TagStats::new(tag));
+            self.update_trimmed_tags();
+            self.stats.last_mut().unwrap()
         }
     }
 
     fn len(&self) -> usize {
-        self.0.len()
+        self.stats.len()
     }
 
     fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.stats.is_empty()
     }
 
     fn iter(&mut self) -> impl Iterator<Item = &TagStats> {
-        self.0.iter()
+        self.stats.iter()
     }
 
     fn iter_mut(&mut self) -> impl Iterator<Item = &mut TagStats> {
-        self.0.iter_mut()
+        self.stats.iter_mut()
+    }
+
+    fn update_trimmed_tags(&mut self) {
+        if self.stats.len() < 2 {
+            return;
+        }
+
+        self.shared_prefix.clear();
+        self.shared_suffix.clear();
+
+        let mut max_tag_length = 0;
+
+        // shared strings can never be longer than the any of the tags, so we'll
+        // just use the first one to iterate over
+        'outer: for i in 0..self.stats[0].tag.len() {
+            for tag in self.stats.iter() {
+                max_tag_length = cmp::max(max_tag_length, tag.tag.len());
+                if tag.tag.chars().nth(i) != self.stats[0].tag.chars().nth(i) {
+                    break 'outer;
+                }
+            }
+            self.shared_prefix
+                .push(self.stats[0].tag.chars().nth(i).unwrap());
+        }
+
+        'outer: for i in 0..self.stats[0].tag.len() {
+            for tag in self.stats.iter() {
+                if tag.tag.chars().nth_back(i) != self.stats[0].tag.chars().nth_back(i) {
+                    break 'outer;
+                }
+            }
+            self.shared_suffix
+                .insert(0, self.stats[0].tag.chars().nth_back(i).unwrap());
+        }
+
+        // we don't need to reduce the tags to nothing
+        let give_some_back =
+            8 + max_tag_length - self.shared_prefix.len() - self.shared_suffix.len();
+        if give_some_back > 0 {
+            self.shared_prefix =
+                self.shared_prefix[..usize::try_from(give_some_back).unwrap()].to_string();
+        }
     }
 }
 
 async fn process(channel: Receiver<Message>, screenheight: u16) {
-    let start = std::time::Instant::now();
     let mut pending_lines: VecDeque<String> = VecDeque::with_capacity(screenheight as usize);
     let mut lines_skipped: u32 = 0;
     let mut tags = TagMap::new();
@@ -402,10 +468,20 @@ async fn process(channel: Receiver<Message>, screenheight: u16) {
 
                 let mut toflush = format!("-- Output sampled at {samplerate}%");
                 let maxtagname = tags.iter().map(|x| x.tag.len()).max().unwrap_or(0); // if we have no tags we don't care about the answer
+                let shared_prefix_len = tags.shared_prefix.len();
+                let shared_suffix_len = tags.shared_suffix.len();
                 for tagmap in tags.iter_mut() {
                     tagmap.process();
-                    let padded_tag =
-                        tagmap.tag.clone() + &" ".repeat(maxtagname - tagmap.tag.len());
+                    let padded_tag = if tagmap.tag.len() < shared_prefix_len + shared_suffix_len {
+                        // no need to print the tag if it's the same as the prefix
+                        "@".to_owned()
+                            + &" ".repeat(maxtagname - shared_prefix_len - shared_suffix_len - 1)
+                    } else {
+                        "".to_owned()
+                            + &tagmap.tag.clone()
+                                [shared_prefix_len..tagmap.tag.len() - shared_suffix_len]
+                            + &" ".repeat(maxtagname - tagmap.tag.len())
+                    };
                     toflush += &format!(
                         "\n-- {padded_tag} {:7.1} {:7.1} {:7.1} req/s",
                         tagmap.instant.get_speed(),
@@ -415,10 +491,6 @@ async fn process(channel: Receiver<Message>, screenheight: u16) {
                 }
                 print!("{}", toflush);
                 std::io::stdout().flush().unwrap();
-                if std::time::Instant::now().duration_since(start).as_secs() > 15 {
-                    println!("\nExiting after 10 seconds");
-                    break;
-                }
                 last_gutter_count = tags.len() as u32;
             }
         }
@@ -482,6 +554,8 @@ fn main() {
         log_dirs.push("/var/log/nginx/".into());
     }
 
+    let max_runtime: Option<u32> = pargs.opt_value_from_str("--runtime").unwrap_or(None);
+
     let number_of_lines: u16 = pargs.value_from_str("--screenheight").unwrap_or_else(|_| {
         use rustix::termios::tcgetwinsize;
         match tcgetwinsize(std::io::stderr()) {
@@ -509,6 +583,7 @@ fn main() {
         log_files,
         number_of_lines,
         tagger,
+        max_runtime,
     };
 
     let remaining = pargs.finish();
@@ -525,10 +600,23 @@ fn main() {
 }
 
 async fn innermain(args: AppArgs) -> Result<(), Error> {
-    let mut senders = 0;
     let (sender, receiver) = bounded(1_000_000);
 
     let async_exec = LocalExecutor::new();
+
+    #[cfg(debug_assertions)]
+    {
+        if args.fast_generator {
+            println!("Fast generator enabled");
+            async_exec.spawn(fake_fast(sender.clone())).detach();
+        }
+        if args.slow_generator {
+            println!("Slow generator enabled");
+            async_exec.spawn(fake_slow(sender.clone())).detach();
+        }
+    }
+
+    let mut logfiles_to_follow = vec![];
 
     for log_file in args.log_files {
         if !log_file.is_file() {
@@ -536,37 +624,11 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
             // but at least we tried our best
             eprintln!("WARNING: Log file {log_file:?} is not a file");
         } else {
-            match args.tagger {
-                Tagger::ByFilename => smol::spawn(follow_tag_filename(
-                    sender.clone(),
-                    log_file.clone(),
-                    log_file.to_string_lossy().to_string(),
-                ))
-                .detach(),
-                Tagger::ByStatusCode => {
-                    smol::spawn(follow_tag_statuscode(sender.clone(), log_file)).detach()
-                }
-                _ => todo!(),
-            };
-            senders += 1;
+            logfiles_to_follow.push(log_file);
         }
     }
 
     let mut dirs_to_check = args.log_dirs;
-
-    #[cfg(debug_assertions)]
-    {
-        if args.fast_generator {
-            println!("Fast generator enabled");
-            async_exec.spawn(fake_fast(sender.clone())).detach();
-            senders += 1;
-        }
-        if args.slow_generator {
-            println!("Slow generator enabled");
-            async_exec.spawn(fake_slow(sender.clone())).detach();
-            senders += 1;
-        }
-    }
 
     #[allow(clippy::manual_while_let_some)]
     while !dirs_to_check.is_empty() {
@@ -582,29 +644,64 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
                     let meta = entry.metadata().await?;
                     if meta.is_dir() {
                         dirs_to_check.push(entry.path());
-                    } else if meta.is_file()
-                        && (entry.file_name() == "access.log" || entry.file_name() == "error.log")
-                    {
+                    } else if meta.is_file() && (entry.file_name() == "access.log") {
                         println!("Added {:?} as reader", entry.path());
-                        async_exec
-                            .spawn(follow_tag_filename(
-                                sender.clone(),
-                                entry.path(),
-                                entry.file_name().to_string_lossy().to_string(),
-                            ))
-                            .detach();
-                        senders += 1;
+                        logfiles_to_follow.push(entry.path());
                     }
                 }
             }
         }
     }
 
-    if senders == 0 {
+    if logfiles_to_follow.is_empty() {
         return Err(Error("No useable log files found".to_string()));
     }
 
+    logfiles_to_follow.sort();
+    logfiles_to_follow.dedup();
+
+    let tagger = match args.tagger {
+        Tagger::Auto => {
+            if logfiles_to_follow.len() > 1 {
+                Tagger::ByFilename
+            } else {
+                Tagger::ByStatusCode
+            }
+        }
+        x => x,
+    };
+
+    for log_file in logfiles_to_follow {
+        match tagger {
+            Tagger::Auto => unreachable!(),
+            Tagger::ByFilename => {
+                async_exec
+                    .spawn(follow_tag_filename(
+                        sender.clone(),
+                        log_file.clone(),
+                        log_file.display().to_string(),
+                    ))
+                    .detach();
+            }
+            Tagger::ByStatusCode => {
+                async_exec
+                    .spawn(follow_tag_statuscode(sender.clone(), log_file))
+                    .detach();
+            }
+        }
+    }
+
     async_exec.spawn(periodic_print(sender.clone())).detach();
+
+    if args.max_runtime.is_some() {
+        let max_runtime = args.max_runtime.unwrap();
+        async_exec
+            .spawn(async move {
+                Timer::after(Duration::from_secs(max_runtime.into())).await;
+                std::process::exit(0);
+            })
+            .detach();
+    }
 
     future::block_on(async_exec.run(process(receiver, args.number_of_lines)));
 
