@@ -1,10 +1,10 @@
 use nginx_tail::InstantSpeedometer;
-use nginx_tail::RingbufferSpeedometer;
 use nginx_tail::SmootherSpeedometer;
 use nginx_tail::Speedometer;
 use smol::LocalExecutor;
 use smol::channel::SendError;
 use smol::fs::File;
+use smol::fs::read_link;
 use smol::future;
 use smol::io::AsyncReadExt as _;
 use smol::io::AsyncSeekExt as _;
@@ -17,6 +17,7 @@ use smol::{
 use std::cmp;
 use std::collections::VecDeque;
 use std::io::Write as _;
+use std::os::fd::AsRawFd as _;
 use std::str::FromStr;
 use std::vec;
 use std::{fmt::Display, path::PathBuf, time::Duration};
@@ -71,27 +72,64 @@ impl Display for Error {
 
 type SenderChannel = Sender<Message>;
 
-struct LineReader<'a> {
-    file: &'a mut File,
-    pending: Vec<u8>,
+struct LineReader {
+    filename: PathBuf,
+    fd_path: PathBuf,
+    file: File,       // the file handle
+    pending: Vec<u8>, // data that was read but not yet processed
     readbuf: Vec<u8>,
 }
 
-impl<'a> LineReader<'a> {
-    fn new(file: &'a mut File) -> Self {
-        LineReader {
+impl LineReader {
+    async fn new(filename: PathBuf) -> Result<Self, String> {
+        let (file, fd_path) = Self::_open_file(filename.clone()).await?;
+        Ok(LineReader {
+            filename,
+            fd_path,
             file,
             pending: vec![],
             readbuf: vec![0; 1024],
-        }
+        })
     }
+
+    async fn _open_file(filename: PathBuf) -> Result<(File, PathBuf), String> {
+        // open the file and get the /proc/self/fd/<fd> path
+        let mut file = smol::fs::File::open(&filename)
+            .await
+            .map_err(|e| e.to_string())?;
+        if file.seek(std::io::SeekFrom::End(0)).await.is_err() {
+            return Err("Error seeking to end of file".into());
+        }
+        let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        Ok((file, fd_path))
+    }
+
     async fn read_lines(&mut self) -> Result<Vec<String>, ()> {
         // TODO: the only-look-for-newlines-in-readbuf might be too optimized
         // for no gain but more complex code. We'll have to do some testing but
         // perhaps we can simply copy all read data at the end of pending and
         // then check for newlines: easier and just as fast?
         match self.file.read(&mut self.readbuf).await {
-            Ok(0) => Ok(vec![]),
+            Ok(0) => {
+                // Did the file get rotated perhaps?
+
+                // read_link operates on a virtual filesystem so it should be pretty fast
+                let current_filename = read_link(self.fd_path.clone())
+                    .await
+                    .unwrap_or_else(|_| PathBuf::new());
+                if current_filename != self.filename {
+                    // yes, it did! Let's try to open the new file
+                    if let Ok((file, fd_path)) = Self::_open_file(self.filename.clone()).await {
+                        self.file = file;
+                        self.fd_path = fd_path;
+                        self.pending.clear();
+                    }
+                } else {
+                    // no, the file is still the same. Let's wait a bit before trying again
+                    Timer::after(Duration::from_millis(50)).await;
+                }
+                Ok(vec![])
+            }
             Ok(n) => {
                 // newline in the data we just read?
                 if let Some(first_newline) = self.readbuf.iter().position(|x| *x == b'\n') {
@@ -103,31 +141,29 @@ impl<'a> LineReader<'a> {
                     let mut ending_pointer = self.pending.len() + first_newline;
                     // slightly peculiar loop instead of a more common `if let()`
                     // because we already know we have at least one line to process
-                    loop {
-                        // TODO
-                        // thread 'main' panicked at src/main.rs:108:53:
-                        // range end index 248 out of range for slice of length 220
-                        // stack backtrace:
-                        //    0: __rustc::rust_begin_unwind
-                        //    1: core::panicking::panic_fmt
-                        //    2: core::slice::index::slice_end_index_len_fail::do_panic::runtime
-                        //    3: core::slice::index::slice_end_index_len_fail
-                        //    4: nginx_tail::LineReader::read_lines::{{closure}}
-                        //    5: <async_executor::AsyncCallOnDrop<Fut,Cleanup> as core::future::future::Future>::poll
-                        //    6: async_task::raw::RawTask<F,T,S,M>::run
-                        //    7: <futures_lite::future::Or<F1,F2> as core::future::future::Future>::poll
-                        //    8: std::thread::local::LocalKey<T>::with
-                        //    9: std::thread::local::LocalKey<T>::with
 
+                    // thread 'main' panicked at src/main.rs:150:53:
+                    // range end index 532 out of range for slice of length 304
+                    // stack backtrace:
+                    //    0: __rustc::rust_begin_unwind
+                    //    1: core::panicking::panic_fmt
+                    //    2: core::slice::index::slice_end_index_len_fail::do_panic::runtime
+                    //    3: core::slice::index::slice_end_index_len_fail
+                    //    4: nginx_tail::LineReader::read_lines::{{closure}}
+                    //    5: <async_executor::AsyncCallOnDrop<Fut,Cleanup> as core::future::future::Future>::poll
+                    //    6: async_task::raw::RawTask<F,T,S,M>::run
+                    //    7: <futures_lite::future::Or<F1,F2> as core::future::future::Future>::poll
+                    //    8: std::thread::local::LocalKey<T>::with
+                    loop {
                         whole_lines.push(
                             String::from_utf8_lossy(
-                                &uninterrupted_slice[starting_pointer..ending_pointer], // <-- this is the problem (line 108)
+                                &uninterrupted_slice[starting_pointer..ending_pointer], // <-- 150
                             )
                             .to_string(),
                         );
 
                         starting_pointer = ending_pointer + 1;
-                        match uninterrupted_slice[starting_pointer..]
+                        match uninterrupted_slice[starting_pointer..self.pending.len() + n]
                             .iter()
                             .position(|x| *x == b'\n')
                         {
@@ -151,25 +187,20 @@ impl<'a> LineReader<'a> {
 }
 
 async fn follow_tag_filename(channel: SenderChannel, file: PathBuf, filename: String) {
-    let mut file = smol::fs::File::open(&file).await.unwrap();
-    // Seek to the end of the file
-    if file.seek(std::io::SeekFrom::End(0)).await.is_err() {
-        eprintln!("Error seeking to end of file {file:?}");
-        return;
-    }
     channel
         .send(Message::RegisterTag(filename.clone()))
         .await
         .unwrap();
-    let mut processor = LineReader::new(&mut file);
+    let mut processor = match LineReader::new(file).await {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error opening file {filename}: {e}");
+            return;
+        }
+    };
     loop {
         match processor.read_lines().await {
             Ok(lines) => {
-                if lines.is_empty() {
-                    // EOF, at least for now
-                    Timer::after(Duration::from_millis(50)).await;
-                    continue;
-                }
                 for line in lines {
                     if channel
                         .send(Message::Line {
@@ -193,21 +224,16 @@ async fn follow_tag_filename(channel: SenderChannel, file: PathBuf, filename: St
 }
 
 async fn follow_tag_statuscode(channel: SenderChannel, file: PathBuf) {
-    let mut file = smol::fs::File::open(&file).await.unwrap();
-    // Seek to the end of the file
-    if file.seek(std::io::SeekFrom::End(0)).await.is_err() {
-        eprintln!("Error seeking to end of file {file:?}");
-        return;
-    }
-    let mut processor = LineReader::new(&mut file);
+    let mut processor = match LineReader::new(file).await {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Error opening file: {e}");
+            return;
+        }
+    };
     loop {
         match processor.read_lines().await {
             Ok(lines) => {
-                if lines.is_empty() {
-                    // EOF, at least for now
-                    Timer::after(Duration::from_millis(50)).await;
-                    continue;
-                }
                 for line in lines {
                     if channel
                         .send(Message::Line {
@@ -299,10 +325,10 @@ const CSI: &str = "\x1b[";
 struct TagStats {
     tag: String,
     start: std::time::Instant,
-    pending: u32,                // pending since start
-    instant: InstantSpeedometer, // processed before start
-    slow: RingbufferSpeedometer, // processed before start
-    smooth: SmootherSpeedometer, // processed before start
+    pending: u32,              // pending since start
+    fast: InstantSpeedometer,  // processed before start
+    aver: SmootherSpeedometer, // processed before start
+    slow: SmootherSpeedometer, // processed before start
 }
 impl TagStats {
     fn new(tag: String) -> Self {
@@ -310,9 +336,9 @@ impl TagStats {
             tag,
             start: std::time::Instant::now(),
             pending: 0,
-            instant: InstantSpeedometer::new(),
-            slow: RingbufferSpeedometer::new(2 << 8),
-            smooth: SmootherSpeedometer::new(0.2),
+            fast: InstantSpeedometer::new(),
+            aver: SmootherSpeedometer::new(0.3),
+            slow: SmootherSpeedometer::new(0.1),
         }
     }
     /// Update the speedometers
@@ -321,9 +347,9 @@ impl TagStats {
         if elapsed == 0 {
             return;
         }
+        self.fast.add_measurement(elapsed, self.pending);
+        self.aver.add_measurement(elapsed, self.pending);
         self.slow.add_measurement(elapsed, self.pending);
-        self.smooth.add_measurement(elapsed, self.pending);
-        self.instant.add_measurement(elapsed, self.pending);
         self.start = std::time::Instant::now();
         self.pending = 0;
     }
@@ -383,7 +409,7 @@ impl TagMap {
         // just use the first one to iterate over
         'outer: for i in 0..self.stats[0].tag.len() {
             for tag in self.stats.iter() {
-                max_tag_length = cmp::max(max_tag_length, tag.tag.len());
+                max_tag_length = cmp::max(max_tag_length, tag.tag.len()); // while we're here, let's also find the max tag length
                 if tag.tag.chars().nth(i) != self.stats[0].tag.chars().nth(i) {
                     break 'outer;
                 }
@@ -402,12 +428,14 @@ impl TagMap {
                 .insert(0, self.stats[0].tag.chars().nth_back(i).unwrap());
         }
 
-        // we don't need to reduce the tags to nothing
-        let give_some_back =
-            8 + max_tag_length - self.shared_prefix.len() - self.shared_suffix.len();
-        if give_some_back > 0 {
-            self.shared_prefix =
-                self.shared_prefix[..usize::try_from(give_some_back).unwrap()].to_string();
+        // we don't need to reduce the tags to nothing,
+        // there's space on the screen for some text
+        let text_left = max_tag_length - self.shared_prefix.len() - self.shared_suffix.len();
+        if text_left < 8 {
+            // we do not alter the suffix: it's probably .log which we want to filter out
+            let chars_to_preserve = 8 - text_left;
+            let cut_from_prefix = cmp::max(0, self.shared_prefix.len() - chars_to_preserve);
+            self.shared_prefix = self.shared_prefix[..cut_from_prefix].to_owned();
         }
     }
 }
@@ -472,8 +500,8 @@ async fn process(channel: Receiver<Message>, screenheight: u16) {
                 let shared_suffix_len = tags.shared_suffix.len();
                 for tagmap in tags.iter_mut() {
                     tagmap.process();
-                    let padded_tag = if tagmap.tag.len() < shared_prefix_len + shared_suffix_len {
-                        // no need to print the tag if it's the same as the prefix
+                    let padded_tag = if tagmap.tag.len() <= shared_prefix_len + shared_suffix_len {
+                        // should no longer happen, but just in case
                         "@".to_owned()
                             + &" ".repeat(maxtagname - shared_prefix_len - shared_suffix_len - 1)
                     } else {
@@ -484,9 +512,9 @@ async fn process(channel: Receiver<Message>, screenheight: u16) {
                     };
                     toflush += &format!(
                         "\n-- {padded_tag} {:7.1} {:7.1} {:7.1} req/s",
-                        tagmap.instant.get_speed(),
-                        tagmap.slow.get_speed(),
-                        tagmap.smooth.get_speed()
+                        tagmap.fast.get_speed(),
+                        tagmap.aver.get_speed(),
+                        tagmap.slow.get_speed()
                     );
                 }
                 print!("{}", toflush);
@@ -556,6 +584,7 @@ fn main() {
 
     let max_runtime: Option<u32> = pargs.opt_value_from_str("--runtime").unwrap_or(None);
 
+    // TODO: let the user specify --loglines instead: with dynamic tags you don't know the right screenheight
     let number_of_lines: u16 = pargs.value_from_str("--screenheight").unwrap_or_else(|_| {
         use rustix::termios::tcgetwinsize;
         match tcgetwinsize(std::io::stderr()) {
@@ -717,6 +746,51 @@ mod tests {
     use smol::future;
     use std::time::Duration;
     use std::{fs::File, io::Write};
+
+    #[test]
+    fn test_tagmap() {
+        let mut tagmap = super::TagMap::new();
+        assert!(tagmap.is_empty());
+        assert_eq!(tagmap.len(), 0);
+
+        let tag1 =
+            tagmap.get_or_create("/var/log/nginx/sites/customer_project_0/access.log".to_owned());
+        assert_eq!(
+            tag1.tag,
+            "/var/log/nginx/sites/customer_project_0/access.log"
+        );
+        assert_eq!(tagmap.len(), 1);
+        assert_eq!(tagmap.shared_prefix, "");
+        assert_eq!(tagmap.shared_suffix, "");
+
+        let tag2 =
+            tagmap.get_or_create("/var/log/nginx/sites/customer_project_1/access.log".to_owned());
+        assert_eq!(
+            tag2.tag,
+            "/var/log/nginx/sites/customer_project_1/access.log"
+        );
+        assert_eq!(tagmap.len(), 2);
+        assert_eq!(tagmap.shared_prefix, "/var/log/nginx/sites/customer_p");
+        assert_eq!(tagmap.shared_suffix, "/access.log");
+
+        tagmap.get_or_create("/var/log/nginx/sites/customer_project_2/access.log".to_owned());
+        assert_eq!(tagmap.len(), 3);
+        assert_eq!(tagmap.shared_prefix, "/var/log/nginx/sites/customer_p");
+        assert_eq!(tagmap.shared_suffix, "/access.log");
+
+        // reuse tag
+        tagmap.get_or_create("/var/log/nginx/sites/customer_project_1/access.log".to_owned());
+        assert_eq!(tagmap.len(), 3);
+        assert_eq!(tagmap.shared_prefix, "/var/log/nginx/sites/customer_p");
+        assert_eq!(tagmap.shared_suffix, "/access.log");
+
+        // like a "root" log file
+        let tag5 = tagmap.get_or_create("/var/log/nginx/sites/access.log".to_owned());
+        assert_eq!(tag5.tag, "/var/log/nginx/sites/access.log");
+        assert_eq!(tagmap.len(), 4);
+        assert_eq!(tagmap.shared_prefix, "/var/log/nginx/sites/");
+        assert_eq!(tagmap.shared_suffix, "/access.log");
+    }
 
     #[test]
     fn test_reading_files() {
