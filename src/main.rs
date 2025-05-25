@@ -105,10 +105,6 @@ impl LineReader {
     }
 
     async fn read_lines(&mut self) -> Result<Vec<String>, ()> {
-        // TODO: the only-look-for-newlines-in-readbuf might be too optimized
-        // for no gain but more complex code. We'll have to do some testing but
-        // perhaps we can simply copy all read data at the end of pending and
-        // then check for newlines: easier and just as fast?
         match self.file.read(&mut self.readbuf).await {
             Ok(0) => {
                 // Did the file get rotated perhaps?
@@ -131,55 +127,34 @@ impl LineReader {
                 Ok(vec![])
             }
             Ok(n) => {
-                // newline in the data we just read?
-                if let Some(first_newline) = self.readbuf.iter().position(|x| *x == b'\n') {
-                    let mut whole_lines = vec![];
-                    // There was! Let's process the entire block of text we have now
-                    let uninterrupted_slice = &[&self.pending, &self.readbuf[..n]].concat();
+                self.pending.extend_from_slice(&self.readbuf[..n]);
 
-                    let mut starting_pointer = 0;
-                    let mut ending_pointer = self.pending.len() + first_newline;
-                    // slightly peculiar loop instead of a more common `if let()`
-                    // because we already know we have at least one line to process
-
-                    // thread 'main' panicked at src/main.rs:150:53:
-                    // range end index 532 out of range for slice of length 304
-                    // stack backtrace:
-                    //    0: __rustc::rust_begin_unwind
-                    //    1: core::panicking::panic_fmt
-                    //    2: core::slice::index::slice_end_index_len_fail::do_panic::runtime
-                    //    3: core::slice::index::slice_end_index_len_fail
-                    //    4: nginx_tail::LineReader::read_lines::{{closure}}
-                    //    5: <async_executor::AsyncCallOnDrop<Fut,Cleanup> as core::future::future::Future>::poll
-                    //    6: async_task::raw::RawTask<F,T,S,M>::run
-                    //    7: <futures_lite::future::Or<F1,F2> as core::future::future::Future>::poll
-                    //    8: std::thread::local::LocalKey<T>::with
-                    loop {
-                        whole_lines.push(
-                            String::from_utf8_lossy(
-                                &uninterrupted_slice[starting_pointer..ending_pointer], // <-- 150
-                            )
-                            .to_string(),
-                        );
-
-                        starting_pointer = ending_pointer + 1;
-                        match uninterrupted_slice[starting_pointer..self.pending.len() + n]
-                            .iter()
-                            .position(|x| *x == b'\n')
-                        {
-                            None => break,
-                            Some(x) => ending_pointer += x + 1,
-                        }
+                let mut whole_lines = vec![];
+                let mut start_of_next = 0;
+                let newlines: Vec<usize> = self
+                    .pending
+                    .iter()
+                    .enumerate()
+                    .filter_map(
+                        |(index, char)| {
+                            if *char == b'\n' { Some(index) } else { None }
+                        },
+                    )
+                    .collect();
+                for newline in newlines {
+                    whole_lines.push(
+                        String::from_utf8_lossy(&self.pending[start_of_next..newline]).to_string(),
+                    );
+                    start_of_next = newline + 1;
+                    if start_of_next == self.pending.len() {
+                        // we consumed _everything_
+                        self.pending.clear();
+                        return Ok(whole_lines);
                     }
-                    self.pending.clear();
-                    self.pending
-                        .extend_from_slice(&uninterrupted_slice[starting_pointer..]);
-                    Ok(whole_lines)
-                } else {
-                    // No newline this time; we'll have to keep the data around for next time
-                    self.pending.extend_from_slice(&self.readbuf[..n]);
-                    Ok(vec![])
                 }
+                // there's still a bit of data left to consume
+                self.pending.drain(..start_of_next);
+                Ok(whole_lines)
             }
             Err(_) => Err(()),
         }
@@ -501,7 +476,6 @@ async fn process(channel: Receiver<Message>, screenheight: u16) {
                 for tagmap in tags.iter_mut() {
                     tagmap.process();
                     let padded_tag = if tagmap.tag.len() <= shared_prefix_len + shared_suffix_len {
-                        // should no longer happen, but just in case
                         "@".to_owned()
                             + &" ".repeat(maxtagname - shared_prefix_len - shared_suffix_len - 1)
                     } else {
