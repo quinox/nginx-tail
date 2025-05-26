@@ -210,10 +210,11 @@ async fn follow_tag_statuscode(channel: SenderChannel, file: PathBuf) {
         match processor.read_lines().await {
             Ok(lines) => {
                 for line in lines {
+                    let statuscode = extract_statuscode(&line);
                     if channel
                         .send(Message::Line {
                             text: line,
-                            tag: "418".to_owned(), // 418 I'm a teapot
+                            tag: statuscode,
                         })
                         .await
                         .is_err()
@@ -405,12 +406,17 @@ impl TagMap {
 
         // we don't need to reduce the tags to nothing,
         // there's space on the screen for some text
-        let text_left = max_tag_length - self.shared_prefix.len() - self.shared_suffix.len();
+        let text_left = dbg!(max_tag_length - self.shared_prefix.len() - self.shared_suffix.len());
         if text_left < 8 {
-            // we do not alter the suffix: it's probably .log which we want to filter out
-            let chars_to_preserve = 8 - text_left;
-            let cut_from_prefix = cmp::max(0, self.shared_prefix.len() - chars_to_preserve);
-            self.shared_prefix = self.shared_prefix[..cut_from_prefix].to_owned();
+            if max_tag_length < 8 {
+                self.shared_prefix = "".to_owned();
+                self.shared_suffix = "".to_owned();
+            } else {
+                // we do not alter the suffix: it's probably .log which we want to filter out
+                let chars_to_preserve = 8 - text_left;
+                let cut_from_prefix = cmp::max(0, self.shared_prefix.len() - chars_to_preserve);
+                self.shared_prefix = self.shared_prefix[..cut_from_prefix].to_owned();
+            }
         }
     }
 }
@@ -711,18 +717,105 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
     Ok(())
 }
 
+fn extract_statuscode(line: &str) -> String {
+    if let Some(first_quote) = line.find('"') {
+        if let Some(second_quote) = line[first_quote + 1..].find('"') {
+            if let Some(end_space) = line[first_quote + 1 + second_quote + 2..].find(' ') {
+                line[first_quote + 1 + second_quote + 2
+                    ..first_quote + 1 + second_quote + 2 + end_space]
+                    .to_owned()
+            } else {
+                "?C".to_owned()
+            }
+        } else {
+            "?B".to_owned()
+        }
+    } else {
+        "?A".to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::Message;
+    use crate::extract_statuscode;
     use crate::follow_tag_filename;
     use smol::LocalExecutor;
     use smol::Timer;
     use smol::future;
+    use std::fs::remove_file;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::str::from_utf8;
     use std::time::Duration;
     use std::{fs::File, io::Write};
 
+    struct TempFile {
+        filename: String,
+        file: File,
+    }
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = remove_file(self.filename.clone());
+        }
+    }
+    impl TempFile {
+        fn new() -> Self {
+            let stdout = Command::new("mktemp")
+                .args(["--suffix", "nginx-tail-testcase"])
+                .output()
+                .expect("Failed to run mktemp")
+                .stdout;
+            let filename = from_utf8(&stdout.strip_suffix(b"\n").unwrap())
+                .expect("Failed to interpret mktemp output")
+                .to_owned();
+            let file = File::options()
+                .read(true)
+                .write(true)
+                .open(PathBuf::from(filename.clone()))
+                .expect(&format!("Failed to open tmpfile '{filename}'"));
+            TempFile { filename, file }
+        }
+    }
+
     #[test]
-    fn test_tagmap() {
+    fn test_parsing() {
+        let variant1 = r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200] "GET /v2/installations/74453/stats?interval=hours&type=evcs&start=1748210400 HTTP/1.0" 200 63 - 0.023 0.022 "-" "UserAgent/123" "https" "some.domain.example""#.to_owned();
+        assert_eq!("200", extract_statuscode(&variant1));
+        let variant2 = r#"123.123.123.123 - - [26/May/2025:19:43:59 +0200] "GET /links.json HTTP/1.1" 200 91 "-" "Monit/5.34.3" 0.004 0.004 ."#.to_owned();
+        assert_eq!("200", extract_statuscode(&variant2));
+    }
+
+    #[test]
+    fn test_tagmap_with_short_tags() {
+        let mut tagmap = super::TagMap::new();
+        assert!(tagmap.is_empty());
+        assert_eq!(tagmap.len(), 0);
+
+        let tag1 = tagmap.get_or_create("200".to_owned());
+        assert_eq!(tag1.tag, "200");
+        assert_eq!(tagmap.len(), 1);
+        assert_eq!(tagmap.shared_prefix, "");
+        assert_eq!(tagmap.shared_suffix, "");
+
+        let tag2 = tagmap.get_or_create("500".to_owned());
+        assert_eq!(tag2.tag, "500");
+        assert_eq!(tagmap.len(), 2);
+        assert_eq!(tagmap.shared_prefix, "");
+        assert_eq!(tagmap.shared_suffix, "");
+
+        tagmap.get_or_create("404".to_owned());
+        assert_eq!(tagmap.len(), 3);
+        assert_eq!(tagmap.shared_prefix, "");
+        assert_eq!(tagmap.shared_suffix, "");
+
+        // reuse tag
+        tagmap.get_or_create("200".to_owned());
+        assert_eq!(tagmap.len(), 3);
+    }
+
+    #[test]
+    fn test_tagmap_with_long_tags() {
         let mut tagmap = super::TagMap::new();
         assert!(tagmap.is_empty());
         assert_eq!(tagmap.len(), 0);
@@ -772,15 +865,16 @@ mod tests {
 
         future::block_on(local_ex.run(async {
             // TODO: use mktemp -d or something (or in-memory files?)
-            let mut file = File::create("/tmp/access.log").unwrap();
+            let tmpfile = TempFile::new();
+            let mut file = &tmpfile.file;
             file.write_all(b"line 1\n").unwrap();
             file.write_all(b"line 2\n").unwrap();
 
             let (sender, receiver) = smol::channel::bounded(10000);
             smol::spawn(follow_tag_filename(
                 sender,
-                "/tmp/access.log".into(),
-                "/tmp/access.log".to_owned(),
+                tmpfile.filename.clone().into(),
+                tmpfile.filename.clone(),
             ))
             .detach();
 
@@ -788,7 +882,7 @@ mod tests {
             Timer::after(Duration::from_millis(70)).await;
             assert_eq!(
                 receiver.try_recv().unwrap(),
-                Message::RegisterTag("/tmp/access.log".to_owned())
+                Message::RegisterTag(tmpfile.filename.clone())
             );
 
             let received = receiver.try_recv();
@@ -805,7 +899,7 @@ mod tests {
                 receiver.try_recv().unwrap(),
                 Message::Line {
                     text: "line 3".to_owned(),
-                    tag: "/tmp/access.log".to_owned()
+                    tag: tmpfile.filename.clone(),
                 },
             );
 
@@ -827,7 +921,7 @@ mod tests {
                 receiver.try_recv().unwrap(),
                 Message::Line {
                     text: "line 4... and a bit".to_owned(),
-                    tag: "/tmp/access.log".to_owned()
+                    tag: tmpfile.filename.clone(),
                 },
             );
 
@@ -838,14 +932,14 @@ mod tests {
                 receiver.try_recv().unwrap(),
                 Message::Line {
                     text: "line 5".to_owned(),
-                    tag: "/tmp/access.log".to_owned()
+                    tag: tmpfile.filename.clone(),
                 },
             );
             assert_eq!(
                 receiver.try_recv().unwrap(),
                 Message::Line {
                     text: "line 6".to_owned(),
-                    tag: "/tmp/access.log".to_owned()
+                    tag: tmpfile.filename.clone(),
                 }
             );
 
@@ -856,21 +950,21 @@ mod tests {
                 receiver.try_recv().unwrap(),
                 Message::Line {
                     text: "line 7".to_owned(),
-                    tag: "/tmp/access.log".to_owned()
+                    tag: tmpfile.filename.clone(),
                 },
             );
             assert_eq!(
                 receiver.try_recv().unwrap(),
                 Message::Line {
                     text: "line 8".to_owned(),
-                    tag: "/tmp/access.log".to_owned()
+                    tag: tmpfile.filename.clone(),
                 },
             );
             assert_eq!(
                 receiver.try_recv().unwrap(),
                 Message::Line {
                     text: "line 9".to_owned(),
-                    tag: "/tmp/access.log".to_owned()
+                    tag: tmpfile.filename.clone(),
                 },
             );
             assert!(receiver.try_recv().is_err());
