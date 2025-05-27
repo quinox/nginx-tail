@@ -38,9 +38,10 @@ struct AppArgs {
     fast_generator: bool,
     #[cfg(debug_assertions)]
     slow_generator: bool,
-    number_of_lines: u16,
+    target_height: u16, // no guarantees
     tagger: Tagger,
     max_runtime: Option<u32>,
+    max_width: u16, // yes guarantees
 }
 
 fn parse_path(s: &std::ffi::OsStr) -> Result<std::path::PathBuf, &'static str> {
@@ -421,14 +422,14 @@ impl TagMap {
     }
 }
 
-async fn process(channel: Receiver<Message>, screenheight: u16) {
-    let mut pending_lines: VecDeque<String> = VecDeque::with_capacity(screenheight as usize);
+async fn process(channel: Receiver<Message>, target_height: u16, max_width: u16) {
+    let mut pending_lines: VecDeque<String> = VecDeque::with_capacity(target_height as usize);
     let mut lines_skipped: u32 = 0;
     let mut tags = TagMap::new();
     let mut last_gutter_count: u32 = 0;
 
     loop {
-        let number_of_lines = screenheight - tags.len() as u16 - 2; // we'll try to show the last output line of last time at the top
+        let number_of_lines = target_height - tags.len() as u16 - 2; // we'll try to show the last output line of last time at the top
         match channel.recv().await {
             Err(_) => {
                 eprintln!("Channel closed.");
@@ -470,7 +471,12 @@ async fn process(channel: Receiver<Message>, screenheight: u16) {
                     }
                 };
                 for line in pending_lines.iter() {
-                    println!("{line}");
+                    if line.len() > max_width as usize {
+                        // truncate the line to fit the screen
+                        println!("{}", &line[..max_width as usize]);
+                    } else {
+                        println!("{}", line);
+                    }
                 }
                 pending_lines.clear();
                 lines_skipped = 0;
@@ -565,7 +571,7 @@ fn main() {
     let max_runtime: Option<u32> = pargs.opt_value_from_str("--runtime").unwrap_or(None);
 
     // TODO: let the user specify --loglines instead: with dynamic tags you don't know the right screenheight
-    let number_of_lines: u16 = pargs.value_from_str("--screenheight").unwrap_or_else(|_| {
+    let target_height: u16 = pargs.value_from_str("--target-height").unwrap_or_else(|_| {
         use rustix::termios::tcgetwinsize;
         match tcgetwinsize(std::io::stderr()) {
             Ok(x) => x.ws_row,
@@ -583,6 +589,14 @@ fn main() {
         std::process::exit(2);
     }
 
+    let max_width: u16 = pargs.value_from_str("--max-width").unwrap_or_else(|_| {
+        use rustix::termios::tcgetwinsize;
+        match tcgetwinsize(std::io::stderr()) {
+            Ok(x) => x.ws_col,
+            _ => 80,
+        }
+    });
+
     let args = AppArgs {
         #[cfg(debug_assertions)]
         fast_generator: pargs.contains("--fast"),
@@ -590,9 +604,10 @@ fn main() {
         slow_generator: pargs.contains("--slow"),
         log_dirs,
         log_files,
-        number_of_lines,
+        target_height,
         tagger,
         max_runtime,
+        max_width,
     };
 
     let remaining = pargs.finish();
@@ -712,7 +727,7 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
             .detach();
     }
 
-    future::block_on(async_exec.run(process(receiver, args.number_of_lines)));
+    future::block_on(async_exec.run(process(receiver, args.target_height, args.max_width)));
 
     Ok(())
 }
