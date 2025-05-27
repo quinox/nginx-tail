@@ -19,6 +19,8 @@ use std::collections::VecDeque;
 use std::io::Write as _;
 use std::os::fd::AsRawFd as _;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::vec;
 use std::{fmt::Display, path::PathBuf, time::Duration};
 
@@ -239,6 +241,7 @@ enum Message {
     Print,               // trigger a print
     RegisterTag(String), // optional; can be used when you know upfront what the tags are
     Line { text: String, tag: String },
+    WinCh(u16),
 }
 async fn periodic_print(channel: SenderChannel) -> Result<(), Error> {
     // update GUI right away
@@ -422,7 +425,7 @@ impl TagMap {
     }
 }
 
-async fn process(channel: Receiver<Message>, target_height: u16, max_width: u16) {
+async fn process(channel: Receiver<Message>, target_height: u16, mut max_width: u16) {
     let mut pending_lines: VecDeque<String> = VecDeque::with_capacity(target_height as usize);
     let mut lines_skipped: u32 = 0;
     let mut tags = TagMap::new();
@@ -434,6 +437,9 @@ async fn process(channel: Receiver<Message>, target_height: u16, max_width: u16)
             Err(_) => {
                 eprintln!("Channel closed.");
                 return;
+            }
+            Ok(Message::WinCh(new_width)) => {
+                max_width = new_width;
             }
             Ok(Message::RegisterTag(tag)) => {
                 let _ = tags.get_or_create(tag);
@@ -537,6 +543,14 @@ impl FromStr for Tagger {
     }
 }
 
+fn get_terminal_width() -> u16 {
+    use rustix::termios::tcgetwinsize;
+    match tcgetwinsize(std::io::stderr()) {
+        Ok(x) => x.ws_col,
+        Err(_) => 80, // default to 80 columns if we can't get the terminal size
+    }
+}
+
 fn main() {
     let mut pargs = pico_args::Arguments::from_env();
     if pargs.contains(["-h", "--help"]) {
@@ -589,13 +603,9 @@ fn main() {
         std::process::exit(2);
     }
 
-    let max_width: u16 = pargs.value_from_str("--max-width").unwrap_or_else(|_| {
-        use rustix::termios::tcgetwinsize;
-        match tcgetwinsize(std::io::stderr()) {
-            Ok(x) => x.ws_col,
-            _ => 80,
-        }
-    });
+    let max_width: u16 = pargs
+        .value_from_str("--max-width")
+        .unwrap_or_else(|_| get_terminal_width());
 
     let args = AppArgs {
         #[cfg(debug_assertions)]
@@ -623,10 +633,37 @@ fn main() {
     }
 }
 
+async fn winch_handler(channel: SenderChannel) {
+    let window_changed_size = Arc::new(AtomicBool::new(false));
+    let Ok(_) = signal_hook::flag::register(
+        signal_hook::consts::SIGWINCH,
+        Arc::clone(&window_changed_size),
+    ) else {
+        eprintln!("Failed to register signal handler for SIGWINCH");
+        return;
+    };
+
+    loop {
+        if window_changed_size.load(std::sync::atomic::Ordering::Relaxed)
+            && channel
+                .send(Message::WinCh(get_terminal_width()))
+                .await
+                .is_err()
+        {
+            // Channel closed, exit the handler
+            return;
+        }
+        Timer::after(Duration::from_millis(300)).await;
+    }
+}
+
 async fn innermain(args: AppArgs) -> Result<(), Error> {
+    // channel to send messages to the processing thread
     let (sender, receiver) = bounded(1_000_000);
 
     let async_exec = LocalExecutor::new();
+
+    async_exec.spawn(winch_handler(sender.clone())).detach();
 
     #[cfg(debug_assertions)]
     {
