@@ -55,7 +55,6 @@ impl Default for RingbufferSpeedometer {
 impl RingbufferSpeedometer {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "Capacity must be greater than 0");
-        assert!(capacity.is_power_of_two(), "Capacity must be a power of 2");
         let ring = VecDeque::with_capacity(capacity);
         assert!(ring.capacity() == capacity, "This is unexpected");
         Self { measurements: ring }

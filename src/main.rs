@@ -1,5 +1,4 @@
-use nginx_tail::InstantSpeedometer;
-use nginx_tail::SmootherSpeedometer;
+use nginx_tail::RingbufferSpeedometer;
 use nginx_tail::Speedometer;
 use smol::LocalExecutor;
 use smol::channel::SendError;
@@ -283,10 +282,8 @@ const CSI: &str = "\x1b[";
 struct StatusStats {
     statuscode: String,
     start: std::time::Instant,
-    pending: u32,              // pending since start
-    fast: InstantSpeedometer,  // processed before start
-    aver: SmootherSpeedometer, // processed before start
-    slow: SmootherSpeedometer, // processed before start
+    pending: u32, // pending since start
+    ring: RingbufferSpeedometer,
 }
 
 impl StatusStats {
@@ -295,9 +292,7 @@ impl StatusStats {
             statuscode,
             start: std::time::Instant::now(),
             pending: 0,
-            fast: InstantSpeedometer::new(),
-            aver: SmootherSpeedometer::new(0.3),
-            slow: SmootherSpeedometer::new(0.1),
+            ring: RingbufferSpeedometer::new(5),
         }
     }
     fn process(&mut self) {
@@ -305,13 +300,29 @@ impl StatusStats {
         if elapsed == 0 {
             return;
         }
-        self.fast.add_measurement(elapsed, self.pending);
-        self.aver.add_measurement(elapsed, self.pending);
-        self.slow.add_measurement(elapsed, self.pending);
+        self.ring.add_measurement(elapsed, self.pending);
         self.start = std::time::Instant::now();
         self.pending = 0;
     }
 }
+
+impl Ord for StatusStats {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        self.statuscode.cmp(&other.statuscode)
+    }
+}
+impl PartialOrd for StatusStats {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for StatusStats {
+    fn eq(&self, other: &Self) -> bool {
+        self.statuscode == other.statuscode
+    }
+}
+impl Eq for StatusStats {}
+
 struct GroupStats {
     group: String,
     stats: Vec<StatusStats>,
@@ -329,6 +340,7 @@ impl GroupStats {
             &mut self.stats[index]
         } else {
             self.stats.push(StatusStats::new(statuscode));
+            self.stats.sort();
             self.stats.last_mut().unwrap()
         }
     }
@@ -356,7 +368,7 @@ impl GroupMap {
         }
     }
     fn get_or_create(&mut self, tag: String) -> &mut GroupStats {
-        // we only max ~5 tags so looping is faster than a hashmap
+        // we only expect a max of ~5 groups so looping is faster than a hashmap
         if let Some(index) = self.stats.iter().position(|x| x.group == tag) {
             &mut self.stats[index]
         } else {
@@ -490,7 +502,7 @@ async fn process(channel: Receiver<Message>, target_height: u16, requested_width
                     //            |       ________________ move cursor up X lines
                     //            |      |       ________ clear to end of screen
                     //            |      |      |
-                    print!("{CSI}\r{CSI}{}A{CSI}J", groups.len() * 2);
+                    print!("{CSI}\r{CSI}{}A{CSI}J", groups.len());
                 }
 
                 let samplerate: u32 = match lines_skipped {
@@ -532,26 +544,20 @@ async fn process(channel: Receiver<Message>, target_height: u16, requested_width
                         };
                     toflush += &format!("\n-- {padded_tag} ");
                     for statusstats in groupstats.iter() {
+                        let color = match statusstats.statuscode.chars().next() {
+                            Some('2') => format!("{CSI}32m"),
+                            Some('3') => format!("{CSI}35m"),
+                            Some('4') => format!("{CSI}33m"),
+                            Some('5') => format!("{CSI}31m"),
+                            _ => format!("{CSI}37m"),
+                        };
                         toflush += &format!(
-                            "{:7.1} [{}] ",
-                            statusstats.fast.get_speed(),
-                            statusstats.statuscode
+                            "{:7.1} [{}{}{CSI}0m] ",
+                            statusstats.ring.get_speed(),
+                            color,
+                            statusstats.statuscode,
                         );
                     }
-                    toflush += &format!("\n    {}", " ".repeat(padded_group_length));
-                    for statusstats in groupstats.iter() {
-                        toflush += &format!(
-                            "{:7.1} [{}] ",
-                            statusstats.slow.get_speed(),
-                            statusstats.statuscode
-                        );
-                    }
-
-                    //  {:7.1} {:7.1} {:7.1} req/s",
-                    // "x",
-                    // "y",
-                    // "z",
-                    // );
                 }
                 print!("{}", toflush);
                 std::io::stdout().flush().unwrap();
