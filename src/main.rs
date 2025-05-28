@@ -18,7 +18,7 @@ use std::cmp;
 use std::collections::VecDeque;
 use std::io::Write as _;
 use std::os::fd::AsRawFd as _;
-use std::str::FromStr;
+use std::process;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::vec;
@@ -29,7 +29,11 @@ const HELP: &str = r#"
         --log-root <path>                    Path to the nginx log directory
         --log-file <file>                    Path to the nginx log file
         --tagger [ filename | status_code ]  How to group the stats
+        --max-width X                        Cut lines to this length X. Defaults to "screen width", set to 0 for unlimited
         -h, --help                           Show this help message
+        --target-height
+        --max-runtime
+        --combine
 "#;
 
 #[derive(Debug)]
@@ -40,10 +44,10 @@ struct AppArgs {
     fast_generator: bool,
     #[cfg(debug_assertions)]
     slow_generator: bool,
-    target_height: u16, // no guarantees
-    tagger: Tagger,
+    target_height: u16,
+    combine_filestats: bool,
     max_runtime: Option<u32>,
-    max_width: u16, // yes guarantees
+    requested_width: Option<u16>,
 }
 
 fn parse_path(s: &std::ffi::OsStr) -> Result<std::path::PathBuf, &'static str> {
@@ -164,44 +168,11 @@ impl LineReader {
     }
 }
 
-async fn follow_tag_filename(channel: SenderChannel, file: PathBuf, filename: String) {
+async fn follow(channel: SenderChannel, file: PathBuf, group: String) {
     channel
-        .send(Message::RegisterTag(filename.clone()))
+        .send(Message::RegisterGroup(group.clone()))
         .await
         .unwrap();
-    let mut processor = match LineReader::new(file).await {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("Error opening file {filename}: {e}");
-            return;
-        }
-    };
-    loop {
-        match processor.read_lines().await {
-            Ok(lines) => {
-                for line in lines {
-                    if channel
-                        .send(Message::Line {
-                            text: line,
-                            tag: filename.clone(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        // Channel closed
-                        return;
-                    }
-                }
-            }
-            Err(_) => {
-                eprintln!("File {filename} is no longer readable");
-                return;
-            }
-        }
-    }
-}
-
-async fn follow_tag_statuscode(channel: SenderChannel, file: PathBuf) {
     let mut processor = match LineReader::new(file).await {
         Ok(x) => x,
         Err(e) => {
@@ -217,7 +188,8 @@ async fn follow_tag_statuscode(channel: SenderChannel, file: PathBuf) {
                     if channel
                         .send(Message::Line {
                             text: line,
-                            tag: statuscode,
+                            group: group.clone(),
+                            statuscode,
                         })
                         .await
                         .is_err()
@@ -238,9 +210,13 @@ async fn follow_tag_statuscode(channel: SenderChannel, file: PathBuf) {
 /// Message to be sent to the processing thread
 #[derive(Debug, PartialEq)]
 enum Message {
-    Print,               // trigger a print
-    RegisterTag(String), // optional; can be used when you know upfront what the tags are
-    Line { text: String, tag: String },
+    Print,                 // trigger a print
+    RegisterGroup(String), // optional; can be used when you know upfront what the tags are
+    Line {
+        text: String,
+        group: String,
+        statuscode: String,
+    },
     WinCh(u16),
 }
 async fn periodic_print(channel: SenderChannel) -> Result<(), Error> {
@@ -265,7 +241,8 @@ async fn fake_slow(channel: SenderChannel) {
         match channel
             .send(Message::Line {
                 text: format!("Fake slow msg {}", counter),
-                tag: "slowloris".to_owned(),
+                statuscode: "slow".to_owned(),
+                group: "generator".to_owned(),
             })
             .await
         {
@@ -285,7 +262,8 @@ async fn fake_fast(channel: SenderChannel) {
             match channel
                 .send(Message::Line {
                     text: format!("Fake fast msg {i}"),
-                    tag: "fakefast".to_owned(),
+                    statuscode: "fast".to_owned(),
+                    group: "generator".to_owned(),
                 })
                 .await
             {
@@ -302,18 +280,19 @@ async fn fake_fast(channel: SenderChannel) {
 // https://en.wikipedia.org/wiki/ANSI_escape_code#CSI_(Control_Sequence_Introducer)_sequences
 const CSI: &str = "\x1b[";
 
-struct TagStats {
-    tag: String,
+struct StatusStats {
+    statuscode: String,
     start: std::time::Instant,
     pending: u32,              // pending since start
     fast: InstantSpeedometer,  // processed before start
     aver: SmootherSpeedometer, // processed before start
     slow: SmootherSpeedometer, // processed before start
 }
-impl TagStats {
-    fn new(tag: String) -> Self {
+
+impl StatusStats {
+    fn new(statuscode: String) -> Self {
         Self {
-            tag,
+            statuscode,
             start: std::time::Instant::now(),
             pending: 0,
             fast: InstantSpeedometer::new(),
@@ -321,7 +300,6 @@ impl TagStats {
             slow: SmootherSpeedometer::new(0.1),
         }
     }
-    /// Update the speedometers
     fn process(&mut self) {
         let elapsed = self.start.elapsed().as_millis() as u32;
         if elapsed == 0 {
@@ -334,13 +312,42 @@ impl TagStats {
         self.pending = 0;
     }
 }
+struct GroupStats {
+    group: String,
+    stats: Vec<StatusStats>,
+}
+impl GroupStats {
+    fn new(group: String) -> Self {
+        Self {
+            group,
+            stats: vec![],
+        }
+    }
+    fn get_or_create(&mut self, statuscode: String) -> &mut StatusStats {
+        // we only max ~5 tags so looping is faster than a hashmap
+        if let Some(index) = self.stats.iter().position(|x| x.statuscode == statuscode) {
+            &mut self.stats[index]
+        } else {
+            self.stats.push(StatusStats::new(statuscode));
+            self.stats.last_mut().unwrap()
+        }
+    }
+    fn process(&mut self) {
+        for statusstats in self.stats.iter_mut() {
+            statusstats.process();
+        }
+    }
+    fn iter(&mut self) -> impl Iterator<Item = &StatusStats> {
+        self.stats.iter()
+    }
+}
 
-struct TagMap {
-    stats: Vec<TagStats>,
+struct GroupMap {
+    stats: Vec<GroupStats>,
     shared_prefix: String,
     shared_suffix: String,
 }
-impl TagMap {
+impl GroupMap {
     fn new() -> Self {
         Self {
             stats: vec![],
@@ -348,12 +355,12 @@ impl TagMap {
             shared_suffix: "".to_owned(),
         }
     }
-    fn get_or_create(&mut self, tag: String) -> &mut TagStats {
+    fn get_or_create(&mut self, tag: String) -> &mut GroupStats {
         // we only max ~5 tags so looping is faster than a hashmap
-        if let Some(index) = self.stats.iter().position(|x| x.tag == tag) {
+        if let Some(index) = self.stats.iter().position(|x| x.group == tag) {
             &mut self.stats[index]
         } else {
-            self.stats.push(TagStats::new(tag));
+            self.stats.push(GroupStats::new(tag));
             self.update_trimmed_tags();
             self.stats.last_mut().unwrap()
         }
@@ -367,11 +374,11 @@ impl TagMap {
         self.stats.is_empty()
     }
 
-    fn iter(&mut self) -> impl Iterator<Item = &TagStats> {
+    fn iter(&mut self) -> impl Iterator<Item = &GroupStats> {
         self.stats.iter()
     }
 
-    fn iter_mut(&mut self) -> impl Iterator<Item = &mut TagStats> {
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut GroupStats> {
         self.stats.iter_mut()
     }
 
@@ -387,30 +394,30 @@ impl TagMap {
 
         // shared strings can never be longer than the any of the tags, so we'll
         // just use the first one to iterate over
-        'outer: for i in 0..self.stats[0].tag.len() {
+        'outer: for i in 0..self.stats[0].group.len() {
             for tag in self.stats.iter() {
-                max_tag_length = cmp::max(max_tag_length, tag.tag.len()); // while we're here, let's also find the max tag length
-                if tag.tag.chars().nth(i) != self.stats[0].tag.chars().nth(i) {
+                max_tag_length = cmp::max(max_tag_length, tag.group.len()); // while we're here, let's also find the max tag length
+                if tag.group.chars().nth(i) != self.stats[0].group.chars().nth(i) {
                     break 'outer;
                 }
             }
             self.shared_prefix
-                .push(self.stats[0].tag.chars().nth(i).unwrap());
+                .push(self.stats[0].group.chars().nth(i).unwrap());
         }
 
-        'outer: for i in 0..self.stats[0].tag.len() {
+        'outer: for i in 0..self.stats[0].group.len() {
             for tag in self.stats.iter() {
-                if tag.tag.chars().nth_back(i) != self.stats[0].tag.chars().nth_back(i) {
+                if tag.group.chars().nth_back(i) != self.stats[0].group.chars().nth_back(i) {
                     break 'outer;
                 }
             }
             self.shared_suffix
-                .insert(0, self.stats[0].tag.chars().nth_back(i).unwrap());
+                .insert(0, self.stats[0].group.chars().nth_back(i).unwrap());
         }
 
         // we don't need to reduce the tags to nothing,
         // there's space on the screen for some text
-        let text_left = dbg!(max_tag_length - self.shared_prefix.len() - self.shared_suffix.len());
+        let text_left = max_tag_length - self.shared_prefix.len() - self.shared_suffix.len();
         if text_left < 8 {
             if max_tag_length < 8 {
                 self.shared_prefix = "".to_owned();
@@ -425,26 +432,42 @@ impl TagMap {
     }
 }
 
-async fn process(channel: Receiver<Message>, target_height: u16, mut max_width: u16) {
+///
+/// requested_width:
+/// Some(0) = unlimited line length  -- no sigwinch handler installed
+/// Some(x) = cut off at x           -- no sigwinch handler installed
+/// None    = use screen's width     -- sigwinch handler installed
+async fn process(channel: Receiver<Message>, target_height: u16, requested_width: Option<u16>) {
     let mut pending_lines: VecDeque<String> = VecDeque::with_capacity(target_height as usize);
     let mut lines_skipped: u32 = 0;
-    let mut tags = TagMap::new();
+    let mut groups = GroupMap::new();
     let mut last_gutter_count: u32 = 0;
 
+    let mut cut_width = match requested_width {
+        None => get_terminal_width(),
+        Some(x) => x,
+    };
+
     loop {
-        let number_of_lines = target_height - tags.len() as u16 - 2; // we'll try to show the last output line of last time at the top
+        let number_of_lines = target_height - groups.len() as u16 - 2; // we'll try to show the last output line of last time at the top
         match channel.recv().await {
             Err(_) => {
                 eprintln!("Channel closed.");
                 return;
             }
-            Ok(Message::WinCh(new_width)) => {
-                max_width = new_width;
+            Ok(Message::WinCh(new_terminal_width)) => {
+                // we only connect the sigwinch handler when the user did not specify a width,
+                // so every WinCh signal we see meant we have to change our width
+                cut_width = new_terminal_width;
             }
-            Ok(Message::RegisterTag(tag)) => {
-                let _ = tags.get_or_create(tag);
+            Ok(Message::RegisterGroup(tag)) => {
+                let _ = groups.get_or_create(tag);
             }
-            Ok(Message::Line { text, tag }) => {
+            Ok(Message::Line {
+                text,
+                group,
+                statuscode,
+            }) => {
                 if pending_lines.len() >= number_of_lines.into() {
                     pending_lines.pop_front();
                     lines_skipped += 1;
@@ -452,13 +475,14 @@ async fn process(channel: Receiver<Message>, target_height: u16, mut max_width: 
                 pending_lines.push_back(text);
 
                 // we only expect up to 5 tags so is prolly faster than a hashmap
-                let tagmap = tags.get_or_create(tag.clone());
-                tagmap.pending += 1;
+                let groupstats = groups.get_or_create(group.clone());
+                let statusstats = groupstats.get_or_create(statuscode.clone());
+                statusstats.pending += 1;
             }
             Ok(Message::Print) => {
                 // making space so we can scroll up later
-                print!("{}", "\n".repeat(tags.len() - last_gutter_count as usize));
-                if tags.is_empty() {
+                print!("{}", "\n".repeat(groups.len() - last_gutter_count as usize));
+                if groups.is_empty() {
                     // using CSI<n>A with n = 0 still moves the cursor up
                     print!("\r{CSI}J");
                 } else {
@@ -466,7 +490,7 @@ async fn process(channel: Receiver<Message>, target_height: u16, mut max_width: 
                     //            |       ________________ move cursor up X lines
                     //            |      |       ________ clear to end of screen
                     //            |      |      |
-                    print!("{CSI}\r{CSI}{}A{CSI}J", tags.len());
+                    print!("{CSI}\r{CSI}{}A{CSI}J", groups.len() * 2);
                 }
 
                 let samplerate: u32 = match lines_skipped {
@@ -477,9 +501,9 @@ async fn process(channel: Receiver<Message>, target_height: u16, mut max_width: 
                     }
                 };
                 for line in pending_lines.iter() {
-                    if line.len() > max_width as usize {
+                    if cut_width != 0 && line.len() > cut_width as usize {
                         // truncate the line to fit the screen
-                        println!("{}", &line[..max_width as usize]);
+                        println!("{}", &line[..cut_width as usize]);
                     } else {
                         println!("{}", line);
                     }
@@ -488,57 +512,51 @@ async fn process(channel: Receiver<Message>, target_height: u16, mut max_width: 
                 lines_skipped = 0;
 
                 let mut toflush = format!("-- Output sampled at {samplerate}%");
-                let maxtagname = tags.iter().map(|x| x.tag.len()).max().unwrap_or(0); // if we have no tags we don't care about the answer
-                let shared_prefix_len = tags.shared_prefix.len();
-                let shared_suffix_len = tags.shared_suffix.len();
-                for tagmap in tags.iter_mut() {
-                    tagmap.process();
-                    let padded_tag = if tagmap.tag.len() <= shared_prefix_len + shared_suffix_len {
-                        "@".to_owned()
-                            + &" ".repeat(maxtagname - shared_prefix_len - shared_suffix_len - 1)
-                    } else {
-                        "".to_owned()
-                            + &tagmap.tag.clone()
-                                [shared_prefix_len..tagmap.tag.len() - shared_suffix_len]
-                            + &" ".repeat(maxtagname - tagmap.tag.len())
-                    };
-                    toflush += &format!(
-                        "\n-- {padded_tag} {:7.1} {:7.1} {:7.1} req/s",
-                        tagmap.fast.get_speed(),
-                        tagmap.aver.get_speed(),
-                        tagmap.slow.get_speed()
-                    );
+                let maxtagname =
+                    cmp::max(8, groups.iter().map(|x| x.group.len()).max().unwrap_or(0)); // if we have no tags we don't care about the answer
+                let shared_prefix_len = groups.shared_prefix.len();
+                let shared_suffix_len = groups.shared_suffix.len();
+                let padded_group_length = maxtagname - shared_prefix_len - shared_suffix_len;
+
+                for groupstats in groups.iter_mut() {
+                    groupstats.process();
+
+                    let padded_tag =
+                        if groupstats.group.len() <= shared_prefix_len + shared_suffix_len {
+                            "@".to_owned() + &" ".repeat(padded_group_length - 1)
+                        } else {
+                            "".to_owned()
+                                + &groupstats.group.clone()
+                                    [shared_prefix_len..groupstats.group.len() - shared_suffix_len]
+                                + &" ".repeat(maxtagname - groupstats.group.len())
+                        };
+                    toflush += &format!("\n-- {padded_tag} ");
+                    for statusstats in groupstats.iter() {
+                        toflush += &format!(
+                            "{:7.1} [{}] ",
+                            statusstats.fast.get_speed(),
+                            statusstats.statuscode
+                        );
+                    }
+                    toflush += &format!("\n    {}", " ".repeat(padded_group_length));
+                    for statusstats in groupstats.iter() {
+                        toflush += &format!(
+                            "{:7.1} [{}] ",
+                            statusstats.slow.get_speed(),
+                            statusstats.statuscode
+                        );
+                    }
+
+                    //  {:7.1} {:7.1} {:7.1} req/s",
+                    // "x",
+                    // "y",
+                    // "z",
+                    // );
                 }
                 print!("{}", toflush);
                 std::io::stdout().flush().unwrap();
-                last_gutter_count = tags.len() as u32;
+                last_gutter_count = groups.len() as u32;
             }
-        }
-    }
-}
-
-const TAGGER_AUTO: &str = "auto";
-const TAGGER_FILENAME: &str = "filename";
-const TAGGER_STATUSCODE: &str = "statuscode";
-const TAGGER_STATUSCODE2: &str = "status_code";
-
-#[derive(Debug)]
-enum Tagger {
-    Auto,
-    ByFilename,
-    ByStatusCode,
-}
-
-impl FromStr for Tagger {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            TAGGER_AUTO => Ok(Tagger::Auto),
-            TAGGER_FILENAME => Ok(Tagger::ByFilename),
-            TAGGER_STATUSCODE => Ok(Tagger::ByStatusCode),
-            TAGGER_STATUSCODE2 => Ok(Tagger::ByStatusCode),
-            _ => Err(format!("Unknown tagger {s}")),
         }
     }
 }
@@ -582,7 +600,7 @@ fn main() {
         log_dirs.push("/var/log/nginx/".into());
     }
 
-    let max_runtime: Option<u32> = pargs.opt_value_from_str("--runtime").unwrap_or(None);
+    let max_runtime: Option<u32> = pargs.opt_value_from_str("--max-runtime").unwrap_or(None);
 
     // TODO: let the user specify --loglines instead: with dynamic tags you don't know the right screenheight
     let target_height: u16 = pargs.value_from_str("--target-height").unwrap_or_else(|_| {
@@ -593,19 +611,17 @@ fn main() {
         }
     });
 
-    let tagger: Tagger = pargs.value_from_str("--tagger").unwrap_or(Tagger::Auto);
+    let requested_width: Option<u16> =
+        if let Ok(reqwidth) = pargs.value_from_str::<&str, String>("--max-width") {
+            Some(reqwidth.parse::<u16>().unwrap_or_else(|err| {
+                eprintln!("Failed to parse {reqwidth} as a number: {err}");
+                process::exit(1)
+            }))
+        } else {
+            None
+        };
 
-    if let Ok(unknown) = pargs.value_from_str::<&str, String>("--tagger") {
-        eprintln!(
-            "Unknown tagger {}. Valid choices: {} {} {}",
-            unknown, TAGGER_AUTO, TAGGER_FILENAME, TAGGER_STATUSCODE
-        );
-        std::process::exit(2);
-    }
-
-    let max_width: u16 = pargs
-        .value_from_str("--max-width")
-        .unwrap_or_else(|_| get_terminal_width());
+    let combine_filestats: bool = pargs.contains("--combine");
 
     let args = AppArgs {
         #[cfg(debug_assertions)]
@@ -615,9 +631,9 @@ fn main() {
         log_dirs,
         log_files,
         target_height,
-        tagger,
+        combine_filestats,
         max_runtime,
-        max_width,
+        requested_width,
     };
 
     let remaining = pargs.finish();
@@ -663,7 +679,9 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
 
     let async_exec = LocalExecutor::new();
 
-    async_exec.spawn(winch_handler(sender.clone())).detach();
+    if args.requested_width.is_none() {
+        async_exec.spawn(winch_handler(sender.clone())).detach();
+    };
 
     #[cfg(debug_assertions)]
     {
@@ -692,6 +710,7 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
     let mut dirs_to_check = args.log_dirs;
 
     #[allow(clippy::manual_while_let_some)]
+    // we're modifying the iterator we're looping over on purpose
     while !dirs_to_check.is_empty() {
         let dir_to_check = dirs_to_check.pop().unwrap();
 
@@ -721,35 +740,17 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
     logfiles_to_follow.sort();
     logfiles_to_follow.dedup();
 
-    let tagger = match args.tagger {
-        Tagger::Auto => {
-            if logfiles_to_follow.len() > 1 {
-                Tagger::ByFilename
-            } else {
-                Tagger::ByStatusCode
-            }
-        }
-        x => x,
-    };
-
     for log_file in logfiles_to_follow {
-        match tagger {
-            Tagger::Auto => unreachable!(),
-            Tagger::ByFilename => {
-                async_exec
-                    .spawn(follow_tag_filename(
-                        sender.clone(),
-                        log_file.clone(),
-                        log_file.display().to_string(),
-                    ))
-                    .detach();
-            }
-            Tagger::ByStatusCode => {
-                async_exec
-                    .spawn(follow_tag_statuscode(sender.clone(), log_file))
-                    .detach();
-            }
-        }
+        async_exec
+            .spawn(follow(
+                sender.clone(),
+                log_file.clone(),
+                match args.combine_filestats {
+                    true => "".to_owned(),
+                    false => log_file.display().to_string(),
+                },
+            ))
+            .detach();
     }
 
     async_exec.spawn(periodic_print(sender.clone())).detach();
@@ -764,7 +765,11 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
             .detach();
     }
 
-    future::block_on(async_exec.run(process(receiver, args.target_height, args.max_width)));
+    future::block_on(async_exec.run(process(
+        receiver,
+        args.target_height,
+        dbg!(args.requested_width),
+    )));
 
     Ok(())
 }
@@ -791,7 +796,6 @@ fn extract_statuscode(line: &str) -> String {
 mod tests {
     use crate::Message;
     use crate::extract_statuscode;
-    use crate::follow_tag_filename;
     use smol::LocalExecutor;
     use smol::Timer;
     use smol::future;
@@ -840,18 +844,18 @@ mod tests {
 
     #[test]
     fn test_tagmap_with_short_tags() {
-        let mut tagmap = super::TagMap::new();
+        let mut tagmap = super::GroupMap::new();
         assert!(tagmap.is_empty());
         assert_eq!(tagmap.len(), 0);
 
         let tag1 = tagmap.get_or_create("200".to_owned());
-        assert_eq!(tag1.tag, "200");
+        assert_eq!(tag1.group, "200");
         assert_eq!(tagmap.len(), 1);
         assert_eq!(tagmap.shared_prefix, "");
         assert_eq!(tagmap.shared_suffix, "");
 
         let tag2 = tagmap.get_or_create("500".to_owned());
-        assert_eq!(tag2.tag, "500");
+        assert_eq!(tag2.group, "500");
         assert_eq!(tagmap.len(), 2);
         assert_eq!(tagmap.shared_prefix, "");
         assert_eq!(tagmap.shared_suffix, "");
@@ -868,14 +872,14 @@ mod tests {
 
     #[test]
     fn test_tagmap_with_long_tags() {
-        let mut tagmap = super::TagMap::new();
+        let mut tagmap = super::GroupMap::new();
         assert!(tagmap.is_empty());
         assert_eq!(tagmap.len(), 0);
 
         let tag1 =
             tagmap.get_or_create("/var/log/nginx/sites/customer_project_0/access.log".to_owned());
         assert_eq!(
-            tag1.tag,
+            tag1.group,
             "/var/log/nginx/sites/customer_project_0/access.log"
         );
         assert_eq!(tagmap.len(), 1);
@@ -885,7 +889,7 @@ mod tests {
         let tag2 =
             tagmap.get_or_create("/var/log/nginx/sites/customer_project_1/access.log".to_owned());
         assert_eq!(
-            tag2.tag,
+            tag2.group,
             "/var/log/nginx/sites/customer_project_1/access.log"
         );
         assert_eq!(tagmap.len(), 2);
@@ -905,7 +909,7 @@ mod tests {
 
         // like a "root" log file
         let tag5 = tagmap.get_or_create("/var/log/nginx/sites/access.log".to_owned());
-        assert_eq!(tag5.tag, "/var/log/nginx/sites/access.log");
+        assert_eq!(tag5.group, "/var/log/nginx/sites/access.log");
         assert_eq!(tagmap.len(), 4);
         assert_eq!(tagmap.shared_prefix, "/var/log/nginx/sites/");
         assert_eq!(tagmap.shared_suffix, "/access.log");
@@ -934,7 +938,7 @@ mod tests {
             Timer::after(Duration::from_millis(70)).await;
             assert_eq!(
                 receiver.try_recv().unwrap(),
-                Message::RegisterTag(tmpfile.filename.clone())
+                Message::RegisterGroup(tmpfile.filename.clone())
             );
 
             let received = receiver.try_recv();
@@ -951,7 +955,7 @@ mod tests {
                 receiver.try_recv().unwrap(),
                 Message::Line {
                     text: "line 3".to_owned(),
-                    tag: tmpfile.filename.clone(),
+                    group: tmpfile.filename.clone(),
                 },
             );
 
@@ -973,7 +977,7 @@ mod tests {
                 receiver.try_recv().unwrap(),
                 Message::Line {
                     text: "line 4... and a bit".to_owned(),
-                    tag: tmpfile.filename.clone(),
+                    group: tmpfile.filename.clone(),
                 },
             );
 
@@ -984,14 +988,14 @@ mod tests {
                 receiver.try_recv().unwrap(),
                 Message::Line {
                     text: "line 5".to_owned(),
-                    tag: tmpfile.filename.clone(),
+                    group: tmpfile.filename.clone(),
                 },
             );
             assert_eq!(
                 receiver.try_recv().unwrap(),
                 Message::Line {
                     text: "line 6".to_owned(),
-                    tag: tmpfile.filename.clone(),
+                    group: tmpfile.filename.clone(),
                 }
             );
 
@@ -1002,21 +1006,21 @@ mod tests {
                 receiver.try_recv().unwrap(),
                 Message::Line {
                     text: "line 7".to_owned(),
-                    tag: tmpfile.filename.clone(),
+                    group: tmpfile.filename.clone(),
                 },
             );
             assert_eq!(
                 receiver.try_recv().unwrap(),
                 Message::Line {
                     text: "line 8".to_owned(),
-                    tag: tmpfile.filename.clone(),
+                    group: tmpfile.filename.clone(),
                 },
             );
             assert_eq!(
                 receiver.try_recv().unwrap(),
                 Message::Line {
                     text: "line 9".to_owned(),
-                    tag: tmpfile.filename.clone(),
+                    group: tmpfile.filename.clone(),
                 },
             );
             assert!(receiver.try_recv().is_err());
