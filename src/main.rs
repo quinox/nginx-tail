@@ -33,6 +33,7 @@ const HELP: &str = r#"
             --target-height      Target window height. Will be met if the log lines fit in the width of your terminal
             --max-runtime X      Terminate after X seconds
             --combine            Combine stats of all files together
+            --merge              Combine http statuscodes in groups
 "#;
 
 #[derive(Debug)]
@@ -45,6 +46,7 @@ struct AppArgs {
     slow_generator: bool,
     target_height: u16,
     combine_filestats: bool,
+    merge_statuscodes: bool,
     max_runtime: Option<u32>,
     requested_width: Option<u16>,
 }
@@ -163,7 +165,12 @@ impl LineReader {
     }
 }
 
-async fn follow(channel: SenderChannel, file: PathBuf, group: String) {
+async fn follow(
+    channel: SenderChannel,
+    file: PathBuf,
+    group: String,
+    statusextractor: fn(&str) -> String,
+) {
     channel
         .send(Message::RegisterGroup(group.clone()))
         .await
@@ -179,7 +186,7 @@ async fn follow(channel: SenderChannel, file: PathBuf, group: String) {
         match processor.read_lines().await {
             Ok(lines) => {
                 for line in lines {
-                    let statuscode = extract_statuscode(&line);
+                    let statuscode = statusextractor(&line);
                     if channel
                         .send(Message::Line {
                             text: line,
@@ -645,6 +652,7 @@ fn main() {
         };
 
     let combine_filestats: bool = pargs.contains("--combine");
+    let merge_statuscodes: bool = pargs.contains("--merge");
 
     #[cfg(debug_assertions)]
     let fast_generator = pargs.contains("--fast");
@@ -684,6 +692,7 @@ fn main() {
         log_files,
         target_height,
         combine_filestats,
+        merge_statuscodes,
         max_runtime,
         requested_width,
     };
@@ -801,6 +810,10 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
                     true => "".to_owned(),
                     false => log_file.display().to_string(),
                 },
+                match args.merge_statuscodes {
+                    false => extract_statuscode,
+                    true => extract_statuscode_group,
+                },
             ))
             .detach();
     }
@@ -842,6 +855,13 @@ fn extract_statuscode(line: &str) -> String {
     } else {
         "?A".to_owned()
     }
+}
+
+fn extract_statuscode_group(line: &str) -> String {
+    format!(
+        "{}xx",
+        extract_statuscode(line).chars().next().unwrap_or('?')
+    )
 }
 
 #[cfg(test)]
@@ -986,6 +1006,7 @@ mod tests {
                 sender,
                 tmpfile.filename.clone().into(),
                 tmpfile.filename.clone(),
+                extract_statuscode,
             ))
             .detach();
 
