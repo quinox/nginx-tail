@@ -477,6 +477,8 @@ async fn process(channel: Receiver<Message>, target_height: u16, requested_width
         Some(x) => x,
     };
 
+    println!("{CSI}?25l"); // hide cursor
+
     loop {
         let number_of_lines = target_height - groups.len() as u16 - 2; // we'll try to show the last output line of last time at the top
         match channel.recv().await {
@@ -703,7 +705,7 @@ fn main() {
     }
 }
 
-async fn winch_handler(channel: SenderChannel) {
+async fn sigwinch_handler(channel: SenderChannel) {
     let window_changed_size = Arc::new(AtomicBool::new(false));
     let Ok(_) = signal_hook::flag::register(
         signal_hook::consts::SIGWINCH,
@@ -727,14 +729,31 @@ async fn winch_handler(channel: SenderChannel) {
     }
 }
 
+async fn sigint_handler() {
+    let terminated = Arc::new(AtomicBool::new(false));
+    let Ok(_) = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&terminated))
+    else {
+        eprintln!("Failed to register signal handler for INT");
+        return;
+    };
+    loop {
+        if terminated.load(std::sync::atomic::Ordering::Relaxed) {
+            println!("{CSI}?25h\nBye"); // show cursor
+            process::exit(0)
+        }
+        Timer::after(Duration::from_millis(50)).await;
+    }
+}
+
 async fn innermain(args: AppArgs) -> Result<(), Error> {
     // channel to send messages to the processing thread
     let (sender, receiver) = bounded(1_000_000);
 
     let async_exec = LocalExecutor::new();
 
+    async_exec.spawn(sigint_handler()).detach();
     if args.requested_width.is_none() {
-        async_exec.spawn(winch_handler(sender.clone())).detach();
+        async_exec.spawn(sigwinch_handler(sender.clone())).detach();
     };
 
     #[cfg(debug_assertions)]
