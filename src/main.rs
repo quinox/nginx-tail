@@ -7,14 +7,14 @@ use smol::fs::read_link;
 use smol::future;
 use smol::io::AsyncReadExt as _;
 use smol::io::AsyncSeekExt as _;
+use smol::lock::Mutex;
 use smol::{
     Timer,
     channel::{Receiver, Sender, bounded},
-    fs::read_dir,
-    stream::StreamExt,
 };
 use std::cmp;
 use std::collections::VecDeque;
+use std::fs::read_dir;
 use std::io::Write as _;
 use std::os::fd::AsRawFd as _;
 use std::process;
@@ -25,14 +25,14 @@ use std::{fmt::Display, path::PathBuf, time::Duration};
 
 const HELP: &str = r#"
     Usage:
-        --log-root <path>                    Path to the nginx log directory
-        --log-file <file>                    Path to the nginx log file
-        --tagger [ filename | status_code ]  How to group the stats
-        --max-width X                        Cut lines to this length X. Defaults to "screen width", set to 0 for unlimited
-        -h, --help                           Show this help message
-        --target-height
-        --max-runtime
-        --combine
+        [ --option | ... ] [ file |  dir | ... ]
+
+    Options:
+        -h, --help               Show this help message
+            --max-width X        Cut lines to this length X. Defaults to "screen width", set to 0 for unlimited
+            --target-height      Target window height. Will be met if the log lines fit in the width of your terminal
+            --max-runtime X      Terminate after X seconds
+            --combine            Combine stats of all files together
 "#;
 
 #[derive(Debug)]
@@ -47,10 +47,6 @@ struct AppArgs {
     combine_filestats: bool,
     max_runtime: Option<u32>,
     requested_width: Option<u16>,
-}
-
-fn parse_path(s: &std::ffi::OsStr) -> Result<std::path::PathBuf, &'static str> {
-    Ok(s.into())
 }
 
 struct Error(String);
@@ -326,19 +322,25 @@ impl Eq for StatusStats {}
 struct GroupStats {
     group: String,
     stats: Vec<StatusStats>,
+    global_statuscodes: GlobalStatuscodes,
 }
 impl GroupStats {
-    fn new(group: String) -> Self {
+    fn new(group: String, global_statuscodes: GlobalStatuscodes) -> Self {
         Self {
             group,
             stats: vec![],
+            global_statuscodes,
         }
     }
-    fn get_or_create(&mut self, statuscode: String) -> &mut StatusStats {
+    async fn get_or_create(&mut self, statuscode: String) -> &mut StatusStats {
         // we only max ~5 tags so looping is faster than a hashmap
         if let Some(index) = self.stats.iter().position(|x| x.statuscode == statuscode) {
             &mut self.stats[index]
         } else {
+            let mut globalstate = self.global_statuscodes.lock().await;
+            globalstate.push(statuscode.clone());
+            globalstate.sort();
+            globalstate.dedup();
             self.stats.push(StatusStats::new(statuscode));
             self.stats.sort();
             self.stats.last_mut().unwrap()
@@ -354,17 +356,21 @@ impl GroupStats {
     }
 }
 
+type GlobalStatuscodes = Arc<Mutex<Vec<String>>>;
+
 struct GroupMap {
     stats: Vec<GroupStats>,
     shared_prefix: String,
     shared_suffix: String,
+    global_statuscodes: GlobalStatuscodes,
 }
 impl GroupMap {
-    fn new() -> Self {
+    fn new(global_statuscodes: GlobalStatuscodes) -> Self {
         Self {
             stats: vec![],
             shared_prefix: "".to_owned(),
             shared_suffix: "".to_owned(),
+            global_statuscodes,
         }
     }
     fn get_or_create(&mut self, tag: String) -> &mut GroupStats {
@@ -372,7 +378,8 @@ impl GroupMap {
         if let Some(index) = self.stats.iter().position(|x| x.group == tag) {
             &mut self.stats[index]
         } else {
-            self.stats.push(GroupStats::new(tag));
+            self.stats
+                .push(GroupStats::new(tag, self.global_statuscodes.clone()));
             self.update_trimmed_tags();
             self.stats.last_mut().unwrap()
         }
@@ -452,7 +459,10 @@ impl GroupMap {
 async fn process(channel: Receiver<Message>, target_height: u16, requested_width: Option<u16>) {
     let mut pending_lines: VecDeque<String> = VecDeque::with_capacity(target_height as usize);
     let mut lines_skipped: u32 = 0;
-    let mut groups = GroupMap::new();
+    // These are unlikely to change often, so we'll track them in memory instead
+    // of recomputing them every time
+    let global_statuscodes = Arc::new(Mutex::new(vec![]));
+    let mut groups = GroupMap::new(global_statuscodes.clone());
     let mut last_gutter_count: u32 = 0;
 
     let mut cut_width = match requested_width {
@@ -488,7 +498,7 @@ async fn process(channel: Receiver<Message>, target_height: u16, requested_width
 
                 // we only expect up to 5 tags so is prolly faster than a hashmap
                 let groupstats = groups.get_or_create(group.clone());
-                let statusstats = groupstats.get_or_create(statuscode.clone());
+                let statusstats = groupstats.get_or_create(statuscode.clone()).await;
                 statusstats.pending += 1;
             }
             Ok(Message::Print) => {
@@ -543,21 +553,52 @@ async fn process(channel: Receiver<Message>, target_height: u16, requested_width
                                 + &" ".repeat(maxtagname - groupstats.group.len())
                         };
                     toflush += &format!("\n-- {padded_tag} ");
-                    for statusstats in groupstats.iter() {
-                        let color = match statusstats.statuscode.chars().next() {
-                            Some('2') => format!("{CSI}32m"),
-                            Some('3') => format!("{CSI}35m"),
-                            Some('4') => format!("{CSI}33m"),
-                            Some('5') => format!("{CSI}31m"),
-                            _ => format!("{CSI}37m"),
+
+                    // This looks a bit messy, but roughly:
+                    // * global_statuscodes is a list of all status codes we have seen so far, sorted
+                    // * groupstats is a list of all status codes we have seen so far for this group, sorted
+                    //
+                    // groupstats is strictly a subset of global_statuscodes.
+                    // Since both are sorted we can iterate over them in parallel which should be quite efficient.
+                    let mut group_statusstats = groupstats.iter();
+                    let mut pending_group_statusstat = None;
+                    for statuscode in global_statuscodes.lock().await.iter() {
+                        if pending_group_statusstat.is_none() {
+                            pending_group_statusstat = group_statusstats.next()
                         };
-                        toflush += &format!(
-                            "{:7.1} [{}{}{CSI}0m] ",
-                            statusstats.ring.get_speed(),
-                            color,
-                            statusstats.statuscode,
-                        );
+                        if pending_group_statusstat.is_some()
+                            && &pending_group_statusstat.unwrap().statuscode == statuscode
+                        {
+                            // This will consuming next_group_statusstat
+                            // which is needed for the next iteration
+                            let unwrapped = pending_group_statusstat.take().unwrap();
+                            let color = match unwrapped.statuscode.chars().next() {
+                                Some('2') => format!("{CSI}32m"),
+                                Some('3') => format!("{CSI}35m"),
+                                Some('4') => format!("{CSI}33m"),
+                                Some('5') => format!("{CSI}31m"),
+                                _ => format!("{CSI}37m"),
+                            };
+                            toflush += &format!(
+                                "{:7.1} [{}{}{CSI}0m] ",
+                                unwrapped.ring.get_speed(),
+                                color,
+                                unwrapped.statuscode,
+                            );
+                        } else {
+                            #[cfg(debug_assertions)]
+                            {
+                                toflush += &format!("{:>7}  {}  ", "", statuscode);
+                            }
+                            #[cfg(not(debug_assertions))]
+                            {
+                                toflush += &format!("{:7}  {}  ", "", " ".repeat(statuscode.len()));
+                            }
+                        }
                     }
+                    // To test: is it more efficient to spend time printing less characters to the screen?
+                    // it looks neater and reduces chance of line wrapping, at any rate.
+                    toflush.truncate(toflush.trim_end().len());
                 }
                 print!("{}", toflush);
                 std::io::stdout().flush().unwrap();
@@ -580,30 +621,6 @@ fn main() {
     if pargs.contains(["-h", "--help"]) {
         println!("{HELP}");
         std::process::exit(0);
-    }
-
-    let mut log_dirs = vec![];
-    while let Some(log_dir) = pargs
-        .opt_value_from_os_str("--log-root", parse_path)
-        .unwrap()
-    {
-        if !log_dir.is_dir() {
-            eprintln!("Error: --log-root must be a directory");
-            std::process::exit(1);
-        }
-        log_dirs.push(log_dir);
-    }
-
-    let mut log_files = vec![];
-    while let Some(log_file) = pargs
-        .opt_value_from_os_str("--log-file", parse_path)
-        .unwrap()
-    {
-        log_files.push(log_file);
-    }
-
-    if log_files.is_empty() && log_dirs.is_empty() {
-        log_dirs.push("/var/log/nginx/".into());
     }
 
     let max_runtime: Option<u32> = pargs.opt_value_from_str("--max-runtime").unwrap_or(None);
@@ -629,11 +646,40 @@ fn main() {
 
     let combine_filestats: bool = pargs.contains("--combine");
 
+    #[cfg(debug_assertions)]
+    let fast_generator = pargs.contains("--fast");
+    #[cfg(debug_assertions)]
+    let slow_generator = pargs.contains("--slow");
+
+    let mut log_dirs = vec![];
+    let mut log_files = vec![];
+    let remaining = pargs.finish();
+    for dir_or_file in remaining {
+        let lossy = dir_or_file.to_string_lossy();
+        if lossy.starts_with("--") {
+            eprintln!("{HELP}\n");
+            eprintln!(
+                "Unknown option {lossy}\nIf you to tail a file/directory that starts with -- use ./--"
+            );
+            std::process::exit(2);
+        }
+        let path = PathBuf::from(dir_or_file);
+        if path.is_dir() {
+            log_dirs.push(path)
+        } else {
+            log_files.push(path)
+        }
+    }
+
+    if log_files.is_empty() && log_dirs.is_empty() {
+        log_dirs.push("/var/log/nginx/".into());
+    }
+
     let args = AppArgs {
         #[cfg(debug_assertions)]
-        fast_generator: pargs.contains("--fast"),
+        fast_generator,
         #[cfg(debug_assertions)]
-        slow_generator: pargs.contains("--slow"),
+        slow_generator,
         log_dirs,
         log_files,
         target_height,
@@ -641,13 +687,6 @@ fn main() {
         max_runtime,
         requested_width,
     };
-
-    let remaining = pargs.finish();
-    if !remaining.is_empty() {
-        eprintln!("{HELP}");
-        eprintln!("Warning: unused arguments left: {remaining:?}.");
-        std::process::exit(2);
-    }
 
     match smol::block_on(innermain(args)) {
         Ok(_) => {}
@@ -720,19 +759,26 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
     while !dirs_to_check.is_empty() {
         let dir_to_check = dirs_to_check.pop().unwrap();
 
-        match read_dir(dir_to_check.clone()).await {
+        match read_dir(dir_to_check.clone()) {
             Err(e) => {
                 println!("WARNING: Failed to read directory {dir_to_check:?}: {e}");
                 continue;
             }
-            Ok(mut entries) => {
-                while let Some(entry) = entries.try_next().await? {
-                    let meta = entry.metadata().await?;
-                    if meta.is_dir() {
-                        dirs_to_check.push(entry.path());
-                    } else if meta.is_file() && (entry.file_name() == "access.log") {
-                        println!("Added {:?} as reader", entry.path());
-                        logfiles_to_follow.push(entry.path());
+            Ok(entries) => {
+                for entry in entries {
+                    match entry {
+                        Err(x) => eprintln!("Failed to process: {x}"),
+                        Ok(entry) => match entry.metadata() {
+                            Err(x) => eprintln!("Failed to process: {entry:?}: {x}"),
+                            Ok(meta) => {
+                                if meta.is_dir() {
+                                    dirs_to_check.push(entry.path());
+                                } else if meta.is_file() && (entry.file_name() == "access.log") {
+                                    println!("Added {:?} as reader", entry.path());
+                                    logfiles_to_follow.push(entry.path());
+                                }
+                            }
+                        },
                     }
                 }
             }
@@ -800,8 +846,10 @@ fn extract_statuscode(line: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::GlobalStatuscodes;
     use crate::Message;
     use crate::extract_statuscode;
+    use crate::follow;
     use smol::LocalExecutor;
     use smol::Timer;
     use smol::future;
@@ -850,7 +898,7 @@ mod tests {
 
     #[test]
     fn test_tagmap_with_short_tags() {
-        let mut tagmap = super::GroupMap::new();
+        let mut tagmap = super::GroupMap::new(GlobalStatuscodes::default());
         assert!(tagmap.is_empty());
         assert_eq!(tagmap.len(), 0);
 
@@ -878,7 +926,7 @@ mod tests {
 
     #[test]
     fn test_tagmap_with_long_tags() {
-        let mut tagmap = super::GroupMap::new();
+        let mut tagmap = super::GroupMap::new(GlobalStatuscodes::default());
         assert!(tagmap.is_empty());
         assert_eq!(tagmap.len(), 0);
 
@@ -933,7 +981,8 @@ mod tests {
             file.write_all(b"line 2\n").unwrap();
 
             let (sender, receiver) = smol::channel::bounded(10000);
-            smol::spawn(follow_tag_filename(
+
+            smol::spawn(follow(
                 sender,
                 tmpfile.filename.clone().into(),
                 tmpfile.filename.clone(),
@@ -962,6 +1011,7 @@ mod tests {
                 Message::Line {
                     text: "line 3".to_owned(),
                     group: tmpfile.filename.clone(),
+                    statuscode: "?A".to_owned(),
                 },
             );
 
@@ -984,6 +1034,7 @@ mod tests {
                 Message::Line {
                     text: "line 4... and a bit".to_owned(),
                     group: tmpfile.filename.clone(),
+                    statuscode: "?A".to_owned(),
                 },
             );
 
@@ -995,6 +1046,7 @@ mod tests {
                 Message::Line {
                     text: "line 5".to_owned(),
                     group: tmpfile.filename.clone(),
+                    statuscode: "?A".to_owned(),
                 },
             );
             assert_eq!(
@@ -1002,6 +1054,7 @@ mod tests {
                 Message::Line {
                     text: "line 6".to_owned(),
                     group: tmpfile.filename.clone(),
+                    statuscode: "?A".to_owned(),
                 }
             );
 
@@ -1013,6 +1066,7 @@ mod tests {
                 Message::Line {
                     text: "line 7".to_owned(),
                     group: tmpfile.filename.clone(),
+                    statuscode: "?A".to_owned(),
                 },
             );
             assert_eq!(
@@ -1020,6 +1074,7 @@ mod tests {
                 Message::Line {
                     text: "line 8".to_owned(),
                     group: tmpfile.filename.clone(),
+                    statuscode: "?A".to_owned(),
                 },
             );
             assert_eq!(
@@ -1027,6 +1082,7 @@ mod tests {
                 Message::Line {
                     text: "line 9".to_owned(),
                     group: tmpfile.filename.clone(),
+                    statuscode: "?A".to_owned(),
                 },
             );
             assert!(receiver.try_recv().is_err());
