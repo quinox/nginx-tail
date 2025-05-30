@@ -479,6 +479,8 @@ async fn process(channel: Receiver<Message>, target_height: u16, requested_width
 
     println!("{CSI}?25l"); // hide cursor
 
+    let mut lastprinted: String = "".to_owned(); // for optimization we want to minimize printing 
+
     loop {
         let number_of_lines = target_height - groups.len() as u16 - 2; // we'll try to show the last output line of last time at the top
         match channel.recv().await {
@@ -511,17 +513,23 @@ async fn process(channel: Receiver<Message>, target_height: u16, requested_width
                 statusstats.pending += 1;
             }
             Ok(Message::Print) => {
-                // making space so we can scroll up later
-                print!("{}", "\n".repeat(groups.len() - last_gutter_count as usize));
+                // Printing to a terminal is _really_ slow, so if our current output
+                // would be the same asthe previous output we'll skip printing at all
+                let mut toflush = "".to_owned();
+                // making space so we can scroll up later without overwriting the old log lines
+
+                toflush += &"\n"
+                    .repeat(groups.len() - last_gutter_count as usize)
+                    .to_string();
                 if groups.is_empty() {
                     // using CSI<n>A with n = 0 still moves the cursor up
-                    print!("\r{CSI}J");
+                    toflush += &format!("\r{CSI}J");
                 } else {
-                    //             _______________________ move cursor to beginning of line
-                    //            |       ________________ move cursor up X lines
-                    //            |      |       ________ clear to end of screen
-                    //            |      |      |
-                    print!("{CSI}\r{CSI}{}A{CSI}J", groups.len());
+                    //                     _______________________ move cursor to beginning of line
+                    //                    |        _______________ move cursor up X lines
+                    //                    |       |      _________ clear to end of screen
+                    //          format!(" |       |     |
+                    toflush += &format!("\r{CSI}{}A{CSI}J", groups.len());
                 }
 
                 let samplerate: u32 = match lines_skipped {
@@ -531,18 +539,23 @@ async fn process(channel: Receiver<Message>, target_height: u16, requested_width
                             / (lines_skipped + pending_lines.len() as u32)
                     }
                 };
+                if !pending_lines.is_empty() {
+                    // at this point we know for sure we are going to print,
+                    // so we can speed up the has-lastprinted-change-check down below
+                    lastprinted = "".to_owned();
+                }
                 for line in pending_lines.iter() {
                     if cut_width != 0 && line.len() > cut_width as usize {
                         // truncate the line to fit the screen
-                        println!("{}", &line[..cut_width as usize]);
+                        toflush += &format!("{}\n", &line[..cut_width as usize]);
                     } else {
-                        println!("{}", line);
+                        toflush += &format!("{}\n", line);
                     }
                 }
                 pending_lines.clear();
                 lines_skipped = 0;
 
-                let mut toflush = format!("-- Output sampled at {samplerate}%");
+                toflush += &format!("-- Output sampled at {samplerate}%");
                 let maxtagname =
                     cmp::max(8, groups.iter().map(|x| x.group.len()).max().unwrap_or(0)); // if we have no tags we don't care about the answer
                 let shared_prefix_len = groups.shared_prefix.len();
@@ -609,9 +622,12 @@ async fn process(channel: Receiver<Message>, target_height: u16, requested_width
                     // it looks neater and reduces chance of line wrapping, at any rate.
                     toflush.truncate(toflush.trim_end().len());
                 }
-                print!("{}", toflush);
-                std::io::stdout().flush().unwrap();
-                last_gutter_count = groups.len() as u32;
+                if toflush != lastprinted {
+                    print!("{}", toflush);
+                    lastprinted = toflush;
+                    std::io::stdout().flush().unwrap();
+                    last_gutter_count = groups.len() as u32;
+                }
             }
         }
     }

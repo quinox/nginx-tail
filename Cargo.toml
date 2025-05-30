@@ -8,3 +8,11 @@ pico-args = { version = "0.5.0", features = ["eq-separator", "short-space-opt"] 
 rustix = { version = "1.0.7", features = ["termios"] }
 signal-hook = { version = "0.3.18", features = [] }
 smol = "2.0.2"
+
+[profile.profiling]
+# See https://github.com/mstange/samply
+# $ https://github.com/mstange/samplyargo install samply
+# $ cargo build --profile profiling
+# $ samply record ./target/profiling/nginx-tail -- /tmp/access.log --max-runtime 5
+inherits = "release"
+debug = true
