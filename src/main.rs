@@ -281,6 +281,12 @@ async fn fake_fast(channel: SenderChannel) {
 
 // https://en.wikipedia.org/wiki/ANSI_escape_code#CSI_(Control_Sequence_Introducer)_sequences
 const CSI: &str = "\x1b[";
+const GREEN: &str = "\x1b[32m";
+const PURPLE: &str = "\x1b[35m";
+const YELLOW: &str = "\x1b[33m";
+const RED: &str = "\x1b[31m";
+const WHITE: &str = "\x1b[1m\x1b[37m"; // bold + white
+const RESET: &str = "\x1b[0m";
 
 struct StatusStats {
     statuscode: String,
@@ -479,7 +485,7 @@ async fn process(channel: Receiver<Message>, target_height: u16, requested_width
 
     println!("{CSI}?25l"); // hide cursor
 
-    let mut lastprinted: String = "".to_owned(); // for optimization we want to minimize printing 
+    let mut lastprinted: String = "".to_owned(); // for optimization we want to minimize printing
 
     loop {
         let number_of_lines = target_height - groups.len() as u16 - 2; // we'll try to show the last output line of last time at the top
@@ -547,7 +553,7 @@ async fn process(channel: Receiver<Message>, target_height: u16, requested_width
                 for line in pending_lines.iter() {
                     if cut_width != 0 && line.len() > cut_width as usize {
                         // truncate the line to fit the screen
-                        toflush += &format!("{}\n", &line[..cut_width as usize]);
+                        toflush += &format!("{}\n", parse_nginx_line(&line[..cut_width as usize]));
                     } else {
                         toflush += &format!("{}\n", line);
                     }
@@ -594,17 +600,10 @@ async fn process(channel: Receiver<Message>, target_height: u16, requested_width
                             // This will consuming next_group_statusstat
                             // which is needed for the next iteration
                             let unwrapped = pending_group_statusstat.take().unwrap();
-                            let color = match unwrapped.statuscode.chars().next() {
-                                Some('2') => format!("{CSI}32m"),
-                                Some('3') => format!("{CSI}35m"),
-                                Some('4') => format!("{CSI}33m"),
-                                Some('5') => format!("{CSI}31m"),
-                                _ => format!("{CSI}37m"),
-                            };
+                            let (color, reset) = code2color(&unwrapped.statuscode);
                             toflush += &format!(
-                                "{:7.1} [{}{}{CSI}0m] ",
+                                "{:7.1} [{color}{}{reset}] ",
                                 unwrapped.ring.get_speed(),
-                                color,
                                 unwrapped.statuscode,
                             );
                         } else {
@@ -638,6 +637,204 @@ fn get_terminal_width() -> u16 {
     match tcgetwinsize(std::io::stderr()) {
         Ok(x) => x.ws_col,
         Err(_) => 80, // default to 80 columns if we can't get the terminal size
+    }
+}
+
+#[derive(PartialEq, Debug)]
+struct ParsedLine {
+    // <field>            the field itself
+    // <field1>_<field2>  the data between field1 and field2
+    head: String,
+    head_date: Option<String>,
+    date: String,
+    date_method: Option<String>,
+    method: String,
+    method_url: Option<String>,
+    url: String,
+    url_lvl: Option<String>,
+    protocollvl: String,
+    lvl_statuscode: Option<String>,
+    statuscode: String,
+    tail: String,
+}
+
+fn parse_nginx_line(line: &str) -> ParsedLine {
+    // Has to be able to parse a partial line!
+    // Take special consideration whether you've seen separator symbols:
+    let mut head = "".to_owned();
+    let mut head_date = None;
+    let mut date = "".to_owned();
+    let mut date_method = None;
+    let mut method = "".to_owned();
+    let mut method_url = None;
+    let mut url = "".to_owned();
+    let mut url_lvl = None;
+    let mut protocollvl = "".to_owned();
+    let mut lvl_statuscode = None;
+    let mut statuscode = "".to_owned();
+    let mut tail = "".to_owned();
+
+    // om nom nom
+    let mut chars = line.chars();
+    #[allow(clippy::never_loop)]
+    'outer: loop {
+        loop {
+            match chars.next() {
+                None => break 'outer,
+                Some('[') => break,
+                Some(chr) => head.push(chr),
+            }
+        }
+        head_date = Some("[".to_owned());
+
+        loop {
+            match chars.next() {
+                None => break 'outer,
+                Some(']') => break,
+                Some(chr) => date.push(chr),
+            }
+        }
+        date_method = Some("]".to_owned());
+        match chars.next() {
+            Some(' ') => date_method = Some("] ".to_owned()),
+            Some(x) => {
+                tail.push(x);
+                break 'outer;
+            }
+            None => break 'outer,
+        }
+        match chars.next() {
+            Some('"') => date_method = Some("] \"".to_owned()),
+            Some(x) => {
+                tail.push(x);
+                break 'outer;
+            }
+            None => break 'outer,
+        }
+        loop {
+            match chars.next() {
+                None => break 'outer,
+                Some(' ') => break,
+                Some(chr) => method.push(chr),
+            }
+        }
+        method_url = Some(" ".to_owned());
+        loop {
+            match chars.next() {
+                None => break 'outer,
+                Some(' ') => break,
+                Some(chr) => url.push(chr),
+            }
+        }
+        url_lvl = Some(" ".to_owned());
+        loop {
+            match chars.next() {
+                None => break 'outer,
+                Some('"') => break,
+                Some(chr) => protocollvl.push(chr),
+            }
+        }
+        lvl_statuscode = Some("\"".to_owned());
+        match chars.next() {
+            Some(' ') => lvl_statuscode = Some("\" ".to_owned()),
+            Some(x) => {
+                tail.push(x);
+                break 'outer;
+            }
+            None => break 'outer,
+        }
+        loop {
+            match chars.next() {
+                None => break 'outer,
+                Some(' ') => {
+                    tail.push(' ');
+                    break;
+                }
+                Some(chr) => statuscode.push(chr),
+            }
+        }
+        break 'outer; // who said Rust didn't have goto ;-)
+    }
+    tail.extend(chars);
+    ParsedLine {
+        head,
+        head_date,
+        date,
+        date_method,
+        method,
+        method_url,
+        url,
+        url_lvl,
+        protocollvl,
+        lvl_statuscode,
+        statuscode,
+        tail,
+    }
+}
+
+type ColorStartEnd = (&'static str, &'static str);
+
+#[inline]
+fn code2color(code: &str) -> ColorStartEnd {
+    match code.chars().next() {
+        None => ("", ""),
+        Some('2') => (GREEN, RESET),
+        Some('3') => (PURPLE, RESET),
+        Some('4') => (YELLOW, RESET),
+        Some('5') => (RED, RESET),
+        _ => (WHITE, RESET),
+    }
+}
+
+impl Display for ParsedLine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Write all the bits separately, returning early when we run out of bits to print
+        // TODO: macro the repeated patterns? Do something clever so we can return Ok() and get it unwrapped and returned?
+        write!(f, "{}", &self.head)?;
+
+        let head_date = if let Some(x) = &self.head_date {
+            x
+        } else {
+            return Ok(());
+        };
+        write!(f, "{head_date}{}", &self.date)?;
+
+        let date_method = if let Some(x) = &self.date_method {
+            x
+        } else {
+            return Ok(());
+        };
+        let (color, reset) = match self.method.as_str() {
+            "POST" => (WHITE, RESET),
+            _ => ("", ""),
+        };
+        write!(f, "{date_method}{color}{}{reset}", &self.method)?;
+
+        let method_url = if let Some(x) = &self.method_url {
+            x
+        } else {
+            return Ok(());
+        };
+        write!(f, "{method_url}{}", &self.url)?;
+
+        let url_lvl = if let Some(x) = &self.url_lvl {
+            x
+        } else {
+            return Ok(());
+        };
+        write!(f, "{url_lvl}{}", &self.protocollvl)?;
+
+        let lvl_statuscode = if let Some(x) = &self.lvl_statuscode {
+            x
+        } else {
+            return Ok(());
+        };
+        let (color, reset) = code2color(&self.statuscode);
+        write!(
+            f,
+            "{lvl_statuscode}{color}{}{reset}{}",
+            &self.statuscode, &self.tail,
+        )
     }
 }
 
@@ -865,11 +1062,7 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
             .detach();
     }
 
-    future::block_on(async_exec.run(process(
-        receiver,
-        args.target_height,
-        dbg!(args.requested_width),
-    )));
+    future::block_on(async_exec.run(process(receiver, args.target_height, args.requested_width)));
 
     Ok(())
 }
@@ -903,8 +1096,11 @@ fn extract_statuscode_group(line: &str) -> String {
 mod tests {
     use crate::GlobalStatuscodes;
     use crate::Message;
+    use crate::ParsedLine;
     use crate::extract_statuscode;
     use crate::follow;
+    use crate::parse_nginx_line;
+    use crate::{GREEN, RESET};
     use smol::LocalExecutor;
     use smol::Timer;
     use smol::future;
@@ -944,11 +1140,145 @@ mod tests {
     }
 
     #[test]
+    fn test_formatting_v2() {
+        // every subsequent assert_eq cuts down the string to test boundary behavior
+        assert_eq!(
+            format!(
+                "{}",
+                parse_nginx_line(
+                    r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200] "GET /v2/installations/74453/stats?interval=hours&type=evcs&start=1748210400 HTTP/1.0" 200 63 - 0.023 0.022 "-" "UserAgent/123" "https" "some.domain.example""#
+                )
+            ),
+            format!(
+                r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200] "GET /v2/installations/74453/stats?interval=hours&type=evcs&start=1748210400 HTTP/1.0" {GREEN}200{RESET} 63 - 0.023 0.022 "-" "UserAgent/123" "https" "some.domain.example""#
+            ),
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                parse_nginx_line(
+                    r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200] "GET /v2/installations/74453/stats?interval=hours&type=evcs&start=1748210400 HTTP/1.0" 200 "#
+                )
+            ),
+            format!(
+                r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200] "GET /v2/installations/74453/stats?interval=hours&type=evcs&start=1748210400 HTTP/1.0" {GREEN}200{RESET} "#
+            ),
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                parse_nginx_line(
+                    r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200] "GET /v2/installations/74453/stats?interval=hours&type=evcs&start=1748210400 HTTP/1.0" 20"#
+                )
+            ),
+            format!(
+                r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200] "GET /v2/installations/74453/stats?interval=hours&type=evcs&start=1748210400 HTTP/1.0" {GREEN}20{RESET}"#
+            ),
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                parse_nginx_line(
+                    r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200] "GET /v2/installations/74453/stats?interval=hours&type=evcs&start=1748210400 HTTP/1.0" 2"#
+                )
+            ),
+            format!(
+                r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200] "GET /v2/installations/74453/stats?interval=hours&type=evcs&start=1748210400 HTTP/1.0" {GREEN}2{RESET}"#
+            ),
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                parse_nginx_line(
+                    r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200] "GET /v2/installations/74453/stats?interval=hours&type=evcs&start=1748210400 HTTP/1.0" "#
+                )
+            ),
+            format!(
+                r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200] "GET /v2/installations/74453/stats?interval=hours&type=evcs&start=1748210400 HTTP/1.0" "#
+            ),
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                parse_nginx_line(
+                    r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200] "GET /v2/installations/74453/stats?interval=hours&type=evcs&start=1748210400 HTTP/1.0""#
+                )
+            ),
+            format!(
+                r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200] "GET /v2/installations/74453/stats?interval=hours&type=evcs&start=1748210400 HTTP/1.0""#
+            ),
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                parse_nginx_line(r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200] "G"#)
+            ),
+            format!(r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200] "G"#),
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                parse_nginx_line(r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200] ""#)
+            ),
+            format!(r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200] ""#),
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                parse_nginx_line(r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200] "#)
+            ),
+            format!(r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200] "#),
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                parse_nginx_line(r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200]"#)
+            ),
+            format!(r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200]"#),
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                parse_nginx_line(r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200"#)
+            ),
+            format!(r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200"#),
+        );
+    }
+
+    #[test]
     fn test_parsing() {
         let variant1 = r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200] "GET /v2/installations/74453/stats?interval=hours&type=evcs&start=1748210400 HTTP/1.0" 200 63 - 0.023 0.022 "-" "UserAgent/123" "https" "some.domain.example""#.to_owned();
         assert_eq!("200", extract_statuscode(&variant1));
         let variant2 = r#"123.123.123.123 - - [26/May/2025:19:43:59 +0200] "GET /links.json HTTP/1.1" 200 91 "-" "Monit/5.34.3" 0.004 0.004 ."#.to_owned();
         assert_eq!("200", extract_statuscode(&variant2));
+
+        // Deconstructing the struct because it looks nicer with assert_eq
+        let ParsedLine {
+            head,
+            head_date,
+            date,
+            date_method,
+            method,
+            method_url,
+            url,
+            url_lvl,
+            protocollvl,
+            lvl_statuscode,
+            statuscode,
+            tail,
+        } = parse_nginx_line(&variant2);
+        assert_eq!(head, "123.123.123.123 - - ");
+        assert_eq!(head_date.unwrap(), "[");
+        assert_eq!(date, "26/May/2025:19:43:59 +0200");
+        assert_eq!(date_method.unwrap(), "] \"");
+        assert_eq!(method, "GET");
+        assert_eq!(method_url.unwrap(), " ");
+        assert_eq!(url, "/links.json");
+        assert_eq!(url_lvl.unwrap(), " ");
+        assert_eq!(protocollvl, "HTTP/1.1");
+        assert_eq!(lvl_statuscode.unwrap(), "\" ");
+        assert_eq!(statuscode, "200");
+        assert_eq!(tail, r#" 91 "-" "Monit/5.34.3" 0.004 0.004 ."#);
     }
 
     #[test]
