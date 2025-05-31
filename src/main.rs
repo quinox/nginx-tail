@@ -169,7 +169,7 @@ async fn follow(
     channel: SenderChannel,
     file: PathBuf,
     group: String,
-    statusextractor: fn(&str) -> String,
+    statusextractor: fn(&str) -> Result<String, String>,
 ) {
     channel
         .send(Message::RegisterGroup(group.clone()))
@@ -186,7 +186,7 @@ async fn follow(
         match processor.read_lines().await {
             Ok(lines) => {
                 for line in lines {
-                    let statuscode = statusextractor(&line);
+                    let statuscode = statusextractor(&line).ok();
                     if channel
                         .send(Message::Line {
                             text: line,
@@ -217,7 +217,7 @@ enum Message {
     Line {
         text: String,
         group: String,
-        statuscode: String,
+        statuscode: Option<String>,
     },
     WinCh(u16),
 }
@@ -243,7 +243,7 @@ async fn fake_slow(channel: SenderChannel) {
         match channel
             .send(Message::Line {
                 text: format!("Fake slow msg {}", counter),
-                statuscode: "slow".to_owned(),
+                statuscode: Some("slow".to_owned()),
                 group: "generator".to_owned(),
             })
             .await
@@ -264,7 +264,7 @@ async fn fake_fast(channel: SenderChannel) {
             match channel
                 .send(Message::Line {
                     text: format!("Fake fast msg {i}"),
-                    statuscode: "fast".to_owned(),
+                    statuscode: Some("fast".to_owned()),
                     group: "generator".to_owned(),
                 })
                 .await
@@ -285,7 +285,8 @@ const GREEN: &str = "\x1b[32m";
 const PURPLE: &str = "\x1b[35m";
 const YELLOW: &str = "\x1b[33m";
 const RED: &str = "\x1b[31m";
-const WHITE: &str = "\x1b[1m\x1b[37m"; // bold + white
+const WHITE: &str = "\x1b[1\x1b[37m"; // bright white
+const ORANGE: &str = "\x1b[93m"; // bright yellow 
 const RESET: &str = "\x1b[0m";
 
 struct StatusStats {
@@ -470,7 +471,8 @@ impl GroupMap {
 /// Some(x) = cut off at x           -- no sigwinch handler installed
 /// None    = use screen's width     -- sigwinch handler installed
 async fn process(channel: Receiver<Message>, target_height: u16, requested_width: Option<u16>) {
-    let mut pending_lines: VecDeque<String> = VecDeque::with_capacity(target_height as usize);
+    let mut pending_lines: VecDeque<(String, Option<String>)> =
+        VecDeque::with_capacity(target_height as usize);
     let mut lines_skipped: u32 = 0;
     // These are unlikely to change often, so we'll track them in memory instead
     // of recomputing them every time
@@ -511,12 +513,14 @@ async fn process(channel: Receiver<Message>, target_height: u16, requested_width
                     pending_lines.pop_front();
                     lines_skipped += 1;
                 };
-                pending_lines.push_back(text);
+                pending_lines.push_back((text, statuscode.clone()));
 
                 // we only expect up to 5 tags so is prolly faster than a hashmap
-                let groupstats = groups.get_or_create(group.clone());
-                let statusstats = groupstats.get_or_create(statuscode.clone()).await;
-                statusstats.pending += 1;
+                if let Some(statuscode) = statuscode {
+                    let groupstats = groups.get_or_create(group.clone());
+                    let statusstats = groupstats.get_or_create(statuscode).await;
+                    statusstats.pending += 1;
+                }
             }
             Ok(Message::Print) => {
                 // Printing to a terminal is _really_ slow, so if our current output
@@ -550,12 +554,19 @@ async fn process(channel: Receiver<Message>, target_height: u16, requested_width
                     // so we can speed up the has-lastprinted-change-check down below
                     lastprinted = "".to_owned();
                 }
-                for line in pending_lines.iter() {
+                for (line, statuscode) in pending_lines.iter() {
+                    let (color, reset) = match statuscode {
+                        None => (ORANGE, RESET),
+                        Some(_) => ("", ""),
+                    };
                     if cut_width != 0 && line.len() > cut_width as usize {
                         // truncate the line to fit the screen
-                        toflush += &format!("{}\n", parse_nginx_line(&line[..cut_width as usize]));
+                        toflush += &format!(
+                            "{color}{}{reset}\n",
+                            parse_nginx_line(&line[..cut_width as usize])
+                        );
                     } else {
-                        toflush += &format!("{}\n", line);
+                        toflush += &format!("{color}{}{reset}\n", line);
                     }
                 }
                 pending_lines.clear();
@@ -1067,29 +1078,35 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
     Ok(())
 }
 
-fn extract_statuscode(line: &str) -> String {
+fn extract_statuscode(line: &str) -> Result<String, String> {
     if let Some(first_quote) = line.find('"') {
+        if line.len() < first_quote + 1 {
+            return Err("?D".to_owned());
+        }
         if let Some(second_quote) = line[first_quote + 1..].find('"') {
+            if line.len() < first_quote + 1 + second_quote + 2 {
+                return Err("?E".to_owned());
+            }
             if let Some(end_space) = line[first_quote + 1 + second_quote + 2..].find(' ') {
-                line[first_quote + 1 + second_quote + 2
+                Ok(line[first_quote + 1 + second_quote + 2
                     ..first_quote + 1 + second_quote + 2 + end_space]
-                    .to_owned()
+                    .to_owned())
             } else {
-                "?C".to_owned()
+                Err("?C".to_owned())
             }
         } else {
-            "?B".to_owned()
+            Err("?B".to_owned())
         }
     } else {
-        "?A".to_owned()
+        Err("?A".to_owned())
     }
 }
 
-fn extract_statuscode_group(line: &str) -> String {
-    format!(
-        "{}xx",
-        extract_statuscode(line).chars().next().unwrap_or('?')
-    )
+fn extract_statuscode_group(line: &str) -> Result<String, String> {
+    match extract_statuscode(line)?.chars().next() {
+        None => Err("?a".to_owned()),
+        Some(x) => Ok(format!("{}xx", x)),
+    }
 }
 
 #[cfg(test)]
@@ -1248,9 +1265,9 @@ mod tests {
     #[test]
     fn test_parsing() {
         let variant1 = r#"v2 1.22.3.44 - - [26/May/2025:00:00:01 +0200] "GET /v2/installations/74453/stats?interval=hours&type=evcs&start=1748210400 HTTP/1.0" 200 63 - 0.023 0.022 "-" "UserAgent/123" "https" "some.domain.example""#.to_owned();
-        assert_eq!("200", extract_statuscode(&variant1));
+        assert_eq!("200", extract_statuscode(&variant1).unwrap());
         let variant2 = r#"123.123.123.123 - - [26/May/2025:19:43:59 +0200] "GET /links.json HTTP/1.1" 200 91 "-" "Monit/5.34.3" 0.004 0.004 ."#.to_owned();
-        assert_eq!("200", extract_statuscode(&variant2));
+        assert_eq!("200", extract_statuscode(&variant2).unwrap());
 
         // Deconstructing the struct because it looks nicer with assert_eq
         let ParsedLine {
@@ -1397,7 +1414,7 @@ mod tests {
                 Message::Line {
                     text: "line 3".to_owned(),
                     group: tmpfile.filename.clone(),
-                    statuscode: "?A".to_owned(),
+                    statuscode: None,
                 },
             );
 
@@ -1420,7 +1437,7 @@ mod tests {
                 Message::Line {
                     text: "line 4... and a bit".to_owned(),
                     group: tmpfile.filename.clone(),
-                    statuscode: "?A".to_owned(),
+                    statuscode: None,
                 },
             );
 
@@ -1432,7 +1449,7 @@ mod tests {
                 Message::Line {
                     text: "line 5".to_owned(),
                     group: tmpfile.filename.clone(),
-                    statuscode: "?A".to_owned(),
+                    statuscode: None,
                 },
             );
             assert_eq!(
@@ -1440,7 +1457,7 @@ mod tests {
                 Message::Line {
                     text: "line 6".to_owned(),
                     group: tmpfile.filename.clone(),
-                    statuscode: "?A".to_owned(),
+                    statuscode: None,
                 }
             );
 
@@ -1452,7 +1469,7 @@ mod tests {
                 Message::Line {
                     text: "line 7".to_owned(),
                     group: tmpfile.filename.clone(),
-                    statuscode: "?A".to_owned(),
+                    statuscode: None,
                 },
             );
             assert_eq!(
@@ -1460,7 +1477,7 @@ mod tests {
                 Message::Line {
                     text: "line 8".to_owned(),
                     group: tmpfile.filename.clone(),
-                    statuscode: "?A".to_owned(),
+                    statuscode: None,
                 },
             );
             assert_eq!(
@@ -1468,7 +1485,7 @@ mod tests {
                 Message::Line {
                     text: "line 9".to_owned(),
                     group: tmpfile.filename.clone(),
-                    statuscode: "?A".to_owned(),
+                    statuscode: None,
                 },
             );
             assert!(receiver.try_recv().is_err());
