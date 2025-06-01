@@ -29,11 +29,16 @@ const HELP: &str = r#"
 
     Options:
         -h, --help               Show this help message
-            --max-width X        Cut lines to this length X. Defaults to "screen width", set to 0 for unlimited
-            --target-height      Target window height. Will be met if the log lines fit in the width of your terminal
+            --max-width X        Cut lines to this length X.
+                                 Defaults to "screen width", set to 0 for unlimited
+            --target-height      Target window height. 
+                                 Will be met if the log lines fit in the width of your terminal
             --max-runtime X      Terminate after X seconds
             --combine            Combine stats of all files together
             --merge              Combine http statuscodes in groups
+            --filter X           Only show log lines matching this status code. 
+                                 Can be used multiple times, "4xx" can be used to show 403, 404 etc.
+                                 The statistics are not affected by this option.
 "#;
 
 #[derive(Debug)]
@@ -49,6 +54,7 @@ struct AppArgs {
     merge_statuscodes: bool,
     max_runtime: Option<u32>,
     requested_width: Option<u16>,
+    filters: Vec<String>,
 }
 
 struct Error(String);
@@ -168,11 +174,11 @@ impl LineReader {
 async fn follow(
     channel: SenderChannel,
     file: PathBuf,
-    group: String,
-    statusextractor: fn(&str) -> Result<String, String>,
+    updowngroup: String,
+    leftrightextractor: fn(&str) -> Option<String>,
 ) {
     channel
-        .send(Message::RegisterGroup(group.clone()))
+        .send(Message::RegisterGroup(updowngroup.clone()))
         .await
         .unwrap();
     let mut processor = match LineReader::new(file).await {
@@ -186,11 +192,16 @@ async fn follow(
         match processor.read_lines().await {
             Ok(lines) => {
                 for line in lines {
-                    let statuscode = statusextractor(&line).ok();
+                    let statuscode = extract_statuscode(&line).ok();
+                    let leftrightgroup = match statuscode.as_deref() {
+                        None => None,
+                        Some(x) => leftrightextractor(x),
+                    };
                     if channel
                         .send(Message::Line {
                             text: line,
-                            group: group.clone(),
+                            updowngroup: updowngroup.clone(),
+                            leftrightgroup,
                             statuscode,
                         })
                         .await
@@ -216,8 +227,9 @@ enum Message {
     RegisterGroup(String), // optional; can be used when you know upfront what the tags are
     Line {
         text: String,
-        group: String,
-        statuscode: Option<String>,
+        updowngroup: String, // usually "/var/log/nginx/site1/access.log", but can be "fe. "Total"
+        leftrightgroup: Option<String>, // either 200,403,404 or 2xx,4xx
+        statuscode: Option<String>, // 200, 403, 404
     },
     WinCh(u16),
 }
@@ -244,7 +256,8 @@ async fn fake_slow(channel: SenderChannel) {
             .send(Message::Line {
                 text: format!("Fake slow msg {}", counter),
                 statuscode: Some("slow".to_owned()),
-                group: "generator".to_owned(),
+                updowngroup: "generator".to_owned(),
+                leftrightgroup: Some("200".to_owned()),
             })
             .await
         {
@@ -264,8 +277,9 @@ async fn fake_fast(channel: SenderChannel) {
             match channel
                 .send(Message::Line {
                     text: format!("Fake fast msg {i}"),
-                    statuscode: Some("fast".to_owned()),
-                    group: "generator".to_owned(),
+                    statuscode: Some("200".to_owned()),
+                    updowngroup: "generator".to_owned(),
+                    leftrightgroup: Some("fake".to_owned()),
                 })
                 .await
             {
@@ -470,7 +484,12 @@ impl GroupMap {
 /// Some(0) = unlimited line length  -- no sigwinch handler installed
 /// Some(x) = cut off at x           -- no sigwinch handler installed
 /// None    = use screen's width     -- sigwinch handler installed
-async fn process(channel: Receiver<Message>, target_height: u16, requested_width: Option<u16>) {
+async fn process(
+    channel: Receiver<Message>,
+    target_height: u16,
+    requested_width: Option<u16>,
+    filters: Vec<String>,
+) {
     let mut pending_lines: VecDeque<(String, Option<String>)> =
         VecDeque::with_capacity(target_height as usize);
     let mut lines_skipped: u32 = 0;
@@ -506,21 +525,31 @@ async fn process(channel: Receiver<Message>, target_height: u16, requested_width
             }
             Ok(Message::Line {
                 text,
-                group,
+                updowngroup,
+                leftrightgroup,
                 statuscode,
             }) => {
+                // accounting
+                // we only expect up to 5 tags so is prolly faster than a hashmap
+                if let Some(leftrightgroup) = leftrightgroup.clone() {
+                    let groupstats = groups.get_or_create(updowngroup.clone());
+                    let statusstats = groupstats.get_or_create(leftrightgroup).await;
+                    statusstats.pending += 1;
+                }
+
+                // filtering
+                if !filters.is_empty() && statuscode.is_some() {
+                    let statuscode = statuscode.clone().unwrap();
+
+                    if !filters.iter().any(|x| statuscode.starts_with(x)) {
+                        continue;
+                    }
+                }
                 if pending_lines.len() >= number_of_lines.into() {
                     pending_lines.pop_front();
                     lines_skipped += 1;
                 };
-                pending_lines.push_back((text, statuscode.clone()));
-
-                // we only expect up to 5 tags so is prolly faster than a hashmap
-                if let Some(statuscode) = statuscode {
-                    let groupstats = groups.get_or_create(group.clone());
-                    let statusstats = groupstats.get_or_create(statuscode).await;
-                    statusstats.pending += 1;
-                }
+                pending_lines.push_back((text, leftrightgroup));
             }
             Ok(Message::Print) => {
                 // Printing to a terminal is _really_ slow, so if our current output
@@ -880,6 +909,13 @@ fn main() {
     let combine_filestats: bool = pargs.contains("--combine");
     let merge_statuscodes: bool = pargs.contains("--merge");
 
+    let mut filters = vec![];
+    while let Ok(filter) = pargs.value_from_str::<&str, String>("--filter") {
+        filters.push(filter.trim_end_matches("x").to_owned());
+    }
+    filters.sort();
+    filters.dedup();
+
     #[cfg(debug_assertions)]
     let fast_generator = pargs.contains("--fast");
     #[cfg(debug_assertions)]
@@ -892,9 +928,7 @@ fn main() {
         let lossy = dir_or_file.to_string_lossy();
         if lossy.starts_with("--") {
             eprintln!("{HELP}\n");
-            eprintln!(
-                "Unknown option {lossy}\nIf you to tail a file/directory that starts with -- use ./--"
-            );
+            eprintln!("Unknown option {lossy}\nUse ./-- if your local path starts with --");
             std::process::exit(2);
         }
         let path = PathBuf::from(dir_or_file);
@@ -921,6 +955,7 @@ fn main() {
         merge_statuscodes,
         max_runtime,
         requested_width,
+        filters,
     };
 
     match smol::block_on(innermain(args)) {
@@ -1054,8 +1089,8 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
                     false => log_file.display().to_string(),
                 },
                 match args.merge_statuscodes {
-                    false => extract_statuscode,
-                    true => extract_statuscode_group,
+                    false => |x| Some(x.to_owned()),
+                    true => get_statuscode_class,
                 },
             ))
             .detach();
@@ -1073,7 +1108,12 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
             .detach();
     }
 
-    future::block_on(async_exec.run(process(receiver, args.target_height, args.requested_width)));
+    future::block_on(async_exec.run(process(
+        receiver,
+        args.target_height,
+        args.requested_width,
+        args.filters,
+    )));
 
     Ok(())
 }
@@ -1102,11 +1142,14 @@ fn extract_statuscode(line: &str) -> Result<String, String> {
     }
 }
 
-fn extract_statuscode_group(line: &str) -> Result<String, String> {
-    match extract_statuscode(line)?.chars().next() {
-        None => Err("?a".to_owned()),
-        Some(x) => Ok(format!("{}xx", x)),
-    }
+fn get_statuscode_class(statuscode: &str) -> Option<String> {
+    // As defined in RFC 9110:
+    // 1xx (Informational): The request was received, continuing process
+    // 2xx (Successful): The request was successfully received, understood, and accepted
+    // 3xx (Redirection): Further action needs to be taken in order to complete the request
+    // 4xx (Client Error): The request contains bad syntax or cannot be fulfilled
+    // 5xx (Server Error): The server failed to fulfill an apparently valid request
+    statuscode.chars().next().map(|x| format!("{}xx", x))
 }
 
 #[cfg(test)]
@@ -1116,6 +1159,7 @@ mod tests {
     use crate::ParsedLine;
     use crate::extract_statuscode;
     use crate::follow;
+    use crate::get_statuscode_class;
     use crate::parse_nginx_line;
     use crate::{GREEN, RESET};
     use smol::LocalExecutor;
@@ -1388,7 +1432,7 @@ mod tests {
                 sender,
                 tmpfile.filename.clone().into(),
                 tmpfile.filename.clone(),
-                extract_statuscode,
+                get_statuscode_class,
             ))
             .detach();
 
@@ -1413,7 +1457,8 @@ mod tests {
                 receiver.try_recv().unwrap(),
                 Message::Line {
                     text: "line 3".to_owned(),
-                    group: tmpfile.filename.clone(),
+                    updowngroup: tmpfile.filename.clone(),
+                    leftrightgroup: None,
                     statuscode: None,
                 },
             );
@@ -1436,7 +1481,8 @@ mod tests {
                 receiver.try_recv().unwrap(),
                 Message::Line {
                     text: "line 4... and a bit".to_owned(),
-                    group: tmpfile.filename.clone(),
+                    updowngroup: tmpfile.filename.clone(),
+                    leftrightgroup: None,
                     statuscode: None,
                 },
             );
@@ -1448,7 +1494,8 @@ mod tests {
                 receiver.try_recv().unwrap(),
                 Message::Line {
                     text: "line 5".to_owned(),
-                    group: tmpfile.filename.clone(),
+                    updowngroup: tmpfile.filename.clone(),
+                    leftrightgroup: None,
                     statuscode: None,
                 },
             );
@@ -1456,7 +1503,8 @@ mod tests {
                 receiver.try_recv().unwrap(),
                 Message::Line {
                     text: "line 6".to_owned(),
-                    group: tmpfile.filename.clone(),
+                    updowngroup: tmpfile.filename.clone(),
+                    leftrightgroup: None,
                     statuscode: None,
                 }
             );
@@ -1468,7 +1516,8 @@ mod tests {
                 receiver.try_recv().unwrap(),
                 Message::Line {
                     text: "line 7".to_owned(),
-                    group: tmpfile.filename.clone(),
+                    updowngroup: tmpfile.filename.clone(),
+                    leftrightgroup: None,
                     statuscode: None,
                 },
             );
@@ -1476,7 +1525,8 @@ mod tests {
                 receiver.try_recv().unwrap(),
                 Message::Line {
                     text: "line 8".to_owned(),
-                    group: tmpfile.filename.clone(),
+                    updowngroup: tmpfile.filename.clone(),
+                    leftrightgroup: None,
                     statuscode: None,
                 },
             );
@@ -1484,7 +1534,8 @@ mod tests {
                 receiver.try_recv().unwrap(),
                 Message::Line {
                     text: "line 9".to_owned(),
-                    group: tmpfile.filename.clone(),
+                    updowngroup: tmpfile.filename.clone(),
+                    leftrightgroup: None,
                     statuscode: None,
                 },
             );

@@ -16,12 +16,15 @@ todo
 
 It should do "the right" thing without configuration. A user should have a good
 time using this tool without having to dig into the command line options. This
-often means the tool will toggle options on/off by itself based on the
-circumstances, with the option to force a state through command line flags.
+often means the tool automatically toggles behavior on/off by itself based on
+the circumstances, with the option to force a state through command line flags.
 
 Threadless async: the workload is perfect for async and we don't need the
 overhead of threads. Blocking IO will be done in separate threads until we can
 master io_uring.
+
+Performant: it should be reasonably fast. It will be used during debugging
+sessions and we don't want to add fuel to a potential fire.
 
 Minimal set of dependencies. If we can easily build something ourselves we
 should. This is educational and reduces supply chain risks. The software only
