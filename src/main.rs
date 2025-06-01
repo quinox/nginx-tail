@@ -588,15 +588,12 @@ async fn process(
                         None => (ORANGE, RESET),
                         Some(_) => ("", ""),
                     };
-                    if cut_width != 0 && line.len() > cut_width as usize {
-                        // truncate the line to fit the screen
-                        toflush += &format!(
-                            "{color}{}{reset}\n",
-                            parse_nginx_line(&line[..cut_width as usize])
-                        );
+                    let trimmed_line = if cut_width != 0 && line.len() > cut_width as usize {
+                        &line[..cut_width as usize]
                     } else {
-                        toflush += &format!("{color}{}{reset}\n", line);
-                    }
+                        &line[..]
+                    };
+                    toflush += &format!("{color}{}{reset}\n", parse_nginx_line(trimmed_line));
                 }
                 pending_lines.clear();
                 lines_skipped = 0;
