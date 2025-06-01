@@ -4,6 +4,30 @@ cd "$(dirname "$0")"
 source helpers/helperhelper.sh
 
 
+test_ci() {
+	banner "ci"
+	readarray -t tests <<<"$(sed -n '/^test_/{ s///; s/(.*//; p }' run_tests)"
+	workflow=".github/workflows/ci.yml"
+	exitcode=0
+	for test in "${tests[@]}"
+	do
+		[[ "$test" == "all" ]] && continue
+		if ! grep "run: ./run_tests $test" "$workflow" >/dev/null
+		then
+			>&2 echo "Missing CI: $workflow does not appear to test $test"
+			>&2 echo "Please add this:"
+			>&2 echo "  test-$test:"
+			>&2 echo "    runs-on: ubuntu-latest"
+			>&2 echo "    steps:"
+			>&2 echo "      - uses: actions/checkout@v4"
+			>&2 echo "      - run: ./run_tests $test"
+			exitcode=1
+		fi
+	done
+
+	[[ "$exitcode" == "0" ]] || exit "$exitcode"
+}
+
 test_clippy() {
     banner "cargo clippy"
     cargo clippy -- --deny warnings
@@ -61,6 +85,11 @@ test_markdown() {
 	./venv/bin/pymarkdown scan README.md
 }
 
+test_release() {
+	banner "Release with musl"
+	./build_release
+}
+
 test_test() {
 	banner "cargo test"
 	cargo test
@@ -83,6 +112,12 @@ test_all() {
 
 	echo ""
 	test_test
+
+	echo ""
+	test_release
+
+	echo ""
+	test_ci
 }
 
 if [[ $# -eq 0 ]]
