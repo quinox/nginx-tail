@@ -6,13 +6,14 @@ source helpers/helperhelper.sh
 
 test_ci() {
 	banner "ci"
-	readarray -t tests <<<"$(sed -n '/^test_/{ s///; s/(.*//; p }' run_tests)"
+	testscript=./$(basename "$0")
+	readarray -t tests <<<"$(sed -n '/^test_/{ s///; s/(.*//; p }' "$testscript")"
 	workflow=".github/workflows/ci.yml"
 	exitcode=0
 	for test in "${tests[@]}"
 	do
 		[[ "$test" == "all" ]] && continue
-		if ! grep "run: ./run_tests $test" "$workflow" >/dev/null
+		if ! grep "run: $testscript $test" "$workflow" >/dev/null
 		then
 			>&2 echo "Missing CI: $workflow does not appear to test $test"
 			>&2 echo "Please add this:"
@@ -20,12 +21,13 @@ test_ci() {
 			>&2 echo "    runs-on: ubuntu-latest"
 			>&2 echo "    steps:"
 			>&2 echo "      - uses: actions/checkout@v4"
-			>&2 echo "      - run: ./run_tests $test"
+			>&2 echo "      - run: $testscript $test"
 			exitcode=1
 		fi
 	done
 
 	[[ "$exitcode" == "0" ]] || exit "$exitcode"
+	>&2 echo "Good: all steps mentioned in $testscript are mentioned in $workflow"
 }
 
 test_clippy() {
@@ -37,6 +39,7 @@ test_clippy() {
 test_fmt() {
 	banner "cargo fmt"
 	cargo fmt --all -- --check
+	>&2 echo "Done"
 }
 
 test_shear() {
@@ -64,7 +67,15 @@ test_shellcheck() {
 	command -v shellcheck >/dev/null || die "Please install shellcheck first: sudo apt install shellcheck"
 
 	# TODO: Check we've tested all Bash scripts
+	bash_scripts=("helpers/helperhelper.sh" "run_tests")
+	found=$(( $(find . -iname '*.sh' | wc --lines) + 1))  # run_tests doesn't end with .sh
+	if [[ "$found" -ne "${#bash_scripts[@]}" ]]
+	then
+		>&2 echo "Please update me: you seem to be missing some scripts. You've mentioned ${#bash_scripts[@]} but there appear to be $found"
+		exit 1
+	fi
 	shellcheck -x helpers/helperhelper.sh run_tests
+	>&2 echo "Done"
 }
 
 test_markdown() {
@@ -83,7 +94,19 @@ test_markdown() {
 	}
 
 	./venv/bin/pymarkdown scan ./*.md
+	>&2 echo "Done"
 }
+
+test_audit() {
+	banner "cargo audit"
+
+	if ! cargo audit --help >/dev/null 2>&1
+	then
+		die "Command not found: cargo audit. Please install it: cargo install cargo-audit --locked"
+	fi
+	cargo audit
+}
+
 
 test_release() {
 	banner "Release with musl"
@@ -95,6 +118,7 @@ test_test() {
 	cargo test
 }
 
+# TODO: Measure their speed and reorder them from fast to slow
 test_all() {
 	test_shear
 
@@ -118,6 +142,9 @@ test_all() {
 
 	echo ""
 	test_ci
+
+	echo ""
+	test_audit
 }
 
 if [[ $# -eq 0 ]]
