@@ -82,7 +82,7 @@ test_markdown() {
 		./venv/bin/pip install pymarkdownlnt==0.9.30;
 	}
 
-	./venv/bin/pymarkdown scan README.md
+	./venv/bin/pymarkdown scan ./*.md
 }
 
 test_release() {

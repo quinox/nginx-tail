@@ -31,13 +31,3 @@ should. This is educational and reduces supply chain risks. The software only
 needs to run on a specific set of servers so we don't need to overly target
 cross compatibility. Releases are built with `musl` to improve portability but
 that's it.
-
-## TODO
-
-* Remove smol in favour of their respective crates? To speed up compilation
-* support updating the stats faster than the logs
-* Remove unwraps where possible
-* use io_uring for async file access?
-* A 'total' line when there are lots of group lines
-* Support reading from stdin
-* CI
