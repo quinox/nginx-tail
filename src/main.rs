@@ -15,6 +15,7 @@ use smol::{
 use std::cmp;
 use std::collections::VecDeque;
 use std::fs::read_dir;
+use std::io::IsTerminal;
 use std::io::Write as _;
 use std::os::fd::AsRawFd as _;
 use std::process;
@@ -55,6 +56,7 @@ struct AppArgs {
     max_runtime: Option<u32>,
     requested_width: Option<u16>,
     filters: Vec<String>,
+    streaming_output: bool,
 }
 
 struct Error(String);
@@ -479,12 +481,50 @@ impl GroupMap {
     }
 }
 
+async fn process_as_streaming(channel: Receiver<Message>, filters: Vec<String>) {
+    loop {
+        match channel.recv().await {
+            Err(_) => {
+                eprintln!("Channel closed");
+                return;
+            }
+            Ok(Message::WinCh(_)) => {
+                #[cfg(debug_assertions)]
+                unreachable!()
+            }
+            Ok(Message::Print) => {
+                #[cfg(debug_assertions)]
+                unreachable!()
+            }
+            Ok(Message::Line {
+                text,
+                updowngroup: _,
+                leftrightgroup: _,
+                statuscode,
+            }) => {
+                // filtering. TODO: DRY
+                if !filters.is_empty() && statuscode.is_some() {
+                    let statuscode = statuscode.clone().unwrap();
+
+                    if !filters.iter().any(|x| statuscode.starts_with(x)) {
+                        continue;
+                    }
+                }
+                println!("{}", parse_nginx_line(&text))
+            }
+            Ok(Message::RegisterGroup(_)) => {
+                // shouldn't happen often
+            }
+        }
+    }
+}
+
 ///
 /// requested_width:
 /// Some(0) = unlimited line length  -- no sigwinch handler installed
 /// Some(x) = cut off at x           -- no sigwinch handler installed
 /// None    = use screen's width     -- sigwinch handler installed
-async fn process(
+async fn process_as_tui(
     channel: Receiver<Message>,
     target_height: u16,
     requested_width: Option<u16>,
@@ -537,7 +577,7 @@ async fn process(
                     statusstats.pending += 1;
                 }
 
-                // filtering
+                // filtering. TODO: DRY
                 if !filters.is_empty() && statuscode.is_some() {
                     let statuscode = statuscode.clone().unwrap();
 
@@ -953,6 +993,7 @@ fn main() {
         max_runtime,
         requested_width,
         filters,
+        streaming_output: !std::io::stdout().is_terminal(),
     };
 
     match smol::block_on(innermain(args)) {
@@ -1004,26 +1045,7 @@ async fn sigint_handler() {
 async fn innermain(args: AppArgs) -> Result<(), Error> {
     // channel to send messages to the processing thread
     let (sender, receiver) = bounded(1_000_000);
-
     let async_exec = LocalExecutor::new();
-
-    async_exec.spawn(sigint_handler()).detach();
-    if args.requested_width.is_none() {
-        async_exec.spawn(sigwinch_handler(sender.clone())).detach();
-    };
-
-    #[cfg(debug_assertions)]
-    {
-        if args.fast_generator {
-            println!("Fast generator enabled");
-            async_exec.spawn(fake_fast(sender.clone())).detach();
-        }
-        if args.slow_generator {
-            println!("Slow generator enabled");
-            async_exec.spawn(fake_slow(sender.clone())).detach();
-        }
-    }
-
     let mut logfiles_to_follow = vec![];
 
     for log_file in args.log_files {
@@ -1093,7 +1115,17 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
             .detach();
     }
 
-    async_exec.spawn(periodic_print(sender.clone())).detach();
+    #[cfg(debug_assertions)]
+    {
+        if args.fast_generator {
+            println!("Fast generator enabled");
+            async_exec.spawn(fake_fast(sender.clone())).detach();
+        }
+        if args.slow_generator {
+            println!("Slow generator enabled");
+            async_exec.spawn(fake_slow(sender.clone())).detach();
+        }
+    }
 
     if args.max_runtime.is_some() {
         let max_runtime = args.max_runtime.unwrap();
@@ -1105,12 +1137,24 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
             .detach();
     }
 
-    future::block_on(async_exec.run(process(
-        receiver,
-        args.target_height,
-        args.requested_width,
-        args.filters,
-    )));
+    if args.streaming_output {
+        // just syntax highlighting (and filtering)
+        future::block_on(async_exec.run(process_as_streaming(receiver, args.filters)))
+    } else {
+        // terminal with live updating stats
+        async_exec.spawn(sigint_handler()).detach();
+        if args.requested_width.is_none() {
+            async_exec.spawn(sigwinch_handler(sender.clone())).detach();
+        };
+        async_exec.spawn(periodic_print(sender.clone())).detach();
+
+        future::block_on(async_exec.run(process_as_tui(
+            receiver,
+            args.target_height,
+            args.requested_width,
+            args.filters,
+        )));
+    }
 
     Ok(())
 }

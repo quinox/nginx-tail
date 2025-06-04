@@ -12,9 +12,41 @@ report, ideas and feature requests.
 
 todo
 
+## Quickstart
+
+Input selection:
+
+```shell
+  # tails all access.log files found in /var/log/nginx:
+  $ nginx-tail
+
+  # tails all access.log files in subfolder (recursive):
+  $ nginx-tail /var/log/nginx/subfolder
+
+  # only tail mysite.log:
+  $ nginx-tail /var/log/nginx/mysite.log
+```
+
+Filtering:
+
+```shell
+  # only show 404 + all 5xx lines:
+  $ nginx-tail --include 404 --include 5xx
+```
+
+Output modes:
+
+```shell
+  # runs as a terminal UI where you see live stats + can scroll back to read lines
+  $ nginx-tail
+
+  # does not render UI but does apply filtering and syntax highlighting:
+  $ nginx-tail | less -R
+```
+
 ## Design
 
-It should do "the right" thing without configuration. A user should have a good
+It should do "the right thing" without configuration. A user should have a good
 time using this tool without having to dig into the command line options. This
 often means the tool automatically toggles behavior on/off by itself based on
 the circumstances, with the option to force a state through command line flags.

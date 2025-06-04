@@ -7,5 +7,4 @@
 * A 'total' line when there are lots of group lines
 * Support reading from stdin
 * CI
-* Tail mode (no stats, always colors + still apply filters)
 * Split `--filter` into `--include` and `--exclude`
