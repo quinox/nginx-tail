@@ -32,12 +32,12 @@ const HELP: &str = r#"
         -h, --help               Show this help message
             --max-width X        Cut lines to this length X.
                                  Defaults to "screen width", set to 0 for unlimited
-            --target-height      Target window height. 
+            --target-height      Target window height.
                                  Will be met if the log lines fit in the width of your terminal
             --max-runtime X      Terminate after X seconds
             --combine            Combine stats of all files together
             --merge              Combine http statuscodes in groups
-            --filter X           Only show log lines matching this status code. 
+            --filter X           Only show log lines matching this status code.
                                  Can be used multiple times, "4xx" can be used to show 403, 404 etc.
                                  The statistics are not affected by this option.
 "#;
@@ -256,7 +256,7 @@ async fn fake_slow(channel: SenderChannel) {
         Timer::after(Duration::from_secs(2)).await;
         match channel
             .send(Message::Line {
-                text: format!("Fake slow msg {}", counter),
+                text: format!("Fake slow msg {counter}"),
                 statuscode: Some("slow".to_owned()),
                 updowngroup: "generator".to_owned(),
                 leftrightgroup: Some("200".to_owned()),
@@ -302,7 +302,7 @@ const PURPLE: &str = "\x1b[35m";
 const YELLOW: &str = "\x1b[33m";
 const RED: &str = "\x1b[31m";
 const WHITE: &str = "\x1b[1\x1b[37m"; // bright white
-const ORANGE: &str = "\x1b[93m"; // bright yellow 
+const ORANGE: &str = "\x1b[93m"; // bright yellow
 const RESET: &str = "\x1b[0m";
 
 struct StatusStats {
@@ -699,7 +699,7 @@ async fn process_as_tui(
                     toflush.truncate(toflush.trim_end().len());
                 }
                 if toflush != lastprinted {
-                    print!("{}", toflush);
+                    print!("{toflush}");
                     lastprinted = toflush;
                     std::io::stdout().flush().unwrap();
                     last_gutter_count = groups.len() as u32;
@@ -1185,7 +1185,7 @@ fn get_statuscode_class(statuscode: &str) -> Option<String> {
     // 3xx (Redirection): Further action needs to be taken in order to complete the request
     // 4xx (Client Error): The request contains bad syntax or cannot be fulfilled
     // 5xx (Server Error): The server failed to fulfill an apparently valid request
-    statuscode.chars().next().map(|x| format!("{}xx", x))
+    statuscode.chars().next().map(|x| format!("{x}xx"))
 }
 
 #[cfg(test)]
