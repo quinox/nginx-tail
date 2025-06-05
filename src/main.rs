@@ -773,21 +773,23 @@ fn parse_nginx_line(line: &str) -> ParsedLine {
         }
         date_method = Some("]".to_owned());
         match chars.next() {
-            Some(' ') => date_method = Some("] ".to_owned()),
+            Some(' ') => date_method.as_mut().unwrap().push(' '),
             Some(x) => {
                 tail.push(x);
                 break 'outer;
             }
             None => break 'outer,
         }
-        match chars.next() {
-            Some('"') => date_method = Some("] \"".to_owned()),
-            Some(x) => {
-                tail.push(x);
-                break 'outer;
+
+        loop {
+            match chars.next() {
+                None => break 'outer,
+                Some('"') => break,
+                Some(chr) => date_method.as_mut().unwrap().push(chr),
             }
-            None => break 'outer,
         }
+        date_method.as_mut().unwrap().push('"');
+
         loop {
             match chars.next() {
                 None => break 'outer,
@@ -813,7 +815,7 @@ fn parse_nginx_line(line: &str) -> ParsedLine {
         }
         lvl_statuscode = Some("\"".to_owned());
         match chars.next() {
-            Some(' ') => lvl_statuscode = Some("\" ".to_owned()),
+            Some(' ') => lvl_statuscode.as_mut().unwrap().push(' '),
             Some(x) => {
                 tail.push(x);
                 break 'outer;
@@ -863,49 +865,42 @@ fn code2color(code: &str) -> ColorStartEnd {
     }
 }
 
+macro_rules! unwrap_or_print_tail_then_return_ok {
+    ($f:expr, $var:expr, $tail:expr) => {
+        if let Some(unwrapped) = $var {
+            unwrapped
+        } else {
+            let _ = write!($f, "{}", $tail);
+            return Ok(());
+        }
+    };
+}
+
 impl Display for ParsedLine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Write all the bits separately, returning early when we run out of bits to print
-        // TODO: macro the repeated patterns? Do something clever so we can return Ok() and get it unwrapped and returned?
+        // self.tail will contain any unparsed text, don't forget to print it
         write!(f, "{}", &self.head)?;
 
-        let head_date = if let Some(x) = &self.head_date {
-            x
-        } else {
-            return Ok(());
-        };
+        let head_date = unwrap_or_print_tail_then_return_ok!(f, &self.head_date, &self.tail);
         write!(f, "{head_date}{}", &self.date)?;
 
-        let date_method = if let Some(x) = &self.date_method {
-            x
-        } else {
-            return Ok(());
-        };
+        let date_method = unwrap_or_print_tail_then_return_ok!(f, &self.date_method, &self.tail);
         let (color, reset) = match self.method.as_str() {
             "POST" => (WHITE, RESET),
             _ => ("", ""),
         };
         write!(f, "{date_method}{color}{}{reset}", &self.method)?;
 
-        let method_url = if let Some(x) = &self.method_url {
-            x
-        } else {
-            return Ok(());
-        };
+        let method_url = unwrap_or_print_tail_then_return_ok!(f, &self.method_url, &self.tail);
         write!(f, "{method_url}{}", &self.url)?;
 
-        let url_lvl = if let Some(x) = &self.url_lvl {
-            x
-        } else {
-            return Ok(());
-        };
+        let url_lvl = unwrap_or_print_tail_then_return_ok!(f, &self.url_lvl, &self.tail);
         write!(f, "{url_lvl}{}", &self.protocollvl)?;
 
-        let lvl_statuscode = if let Some(x) = &self.lvl_statuscode {
-            x
-        } else {
-            return Ok(());
-        };
+        let lvl_statuscode =
+            unwrap_or_print_tail_then_return_ok!(f, &self.lvl_statuscode, self.tail);
+
         let (color, reset) = code2color(&self.statuscode);
         write!(
             f,
@@ -1239,6 +1234,36 @@ mod tests {
                 .expect(&format!("Failed to open tmpfile '{filename}'"));
             TempFile { filename, file }
         }
+    }
+
+    #[test]
+    fn test_formatting_v3() {
+        assert_eq!(
+            format!(
+                "{}",
+                parse_nginx_line(
+                    r#"v3 1.22.3.44 - - [26/May/2025:00:00:01 +0200] 1a2b3c4d5e6f "GET /v2/installations/74453/stats?interval=hours&type=evcs&start=1748210400 HTTP/1.0" 200 63 - 0.023 0.022 "-" "UserAgent/123" "https" "some.domain.example""#
+                )
+            ),
+            format!(
+                r#"v3 1.22.3.44 - - [26/May/2025:00:00:01 +0200] 1a2b3c4d5e6f "GET /v2/installations/74453/stats?interval=hours&type=evcs&start=1748210400 HTTP/1.0" {GREEN}200{RESET} 63 - 0.023 0.022 "-" "UserAgent/123" "https" "some.domain.example""#
+            ),
+        );
+    }
+
+    #[test]
+    fn test_formatting_corruption() {
+        assert_eq!(
+            format!(
+                "{}",
+                parse_nginx_line(
+                    r#"vx 1.22.3.44 - - [26/May/2025:00:00:01 +0200]"GET /v2/installations/74453/stats?interval=hours&type=evcs&start=1748210400 HTTP/1.0" 200 63 - 0.023 0.022 "-" "UserAgent/123" "https" "some.domain.example""#
+                )
+            ),
+            format!(
+                r#"vx 1.22.3.44 - - [26/May/2025:00:00:01 +0200]"GET /v2/installations/74453/stats?interval=hours&type=evcs&start=1748210400 HTTP/1.0" 200 63 - 0.023 0.022 "-" "UserAgent/123" "https" "some.domain.example""#
+            ),
+        );
     }
 
     #[test]
