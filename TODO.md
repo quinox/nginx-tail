@@ -6,5 +6,4 @@
 * use io_uring for async file access?
 * A 'total' line when there are lots of group lines
 * Support reading from stdin
-* CI
 * Split `--filter` into `--include` and `--exclude`
