@@ -336,14 +336,6 @@ pub async fn process_as_streaming(channel: Receiver<Message>, filters: Vec<Strin
     }
 }
 
-pub fn get_terminal_width() -> u16 {
-    use rustix::termios::tcgetwinsize;
-    match tcgetwinsize(std::io::stderr()) {
-        Ok(x) => x.ws_col,
-        Err(_) => 80, // default to 80 columns if we can't get the terminal size
-    }
-}
-
 ///
 /// requested_width:
 /// Some(0) = unlimited line length  -- no sigwinch handler installed
@@ -365,7 +357,7 @@ pub async fn process_as_tui(
     let mut last_gutter_count: u32 = 0;
 
     let mut cut_width = match requested_width {
-        None => get_terminal_width(),
+        None => terminal::get_terminal_width(),
         Some(x) => x,
     };
 

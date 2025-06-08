@@ -3,11 +3,12 @@ use nginx_tail::Message;
 use nginx_tail::SenderChannel;
 use nginx_tail::follow;
 use nginx_tail::get_statuscode_class;
-use nginx_tail::get_terminal_width;
 use nginx_tail::periodic_print;
 use nginx_tail::process_as_streaming;
 use nginx_tail::process_as_tui;
 use nginx_tail::terminal::colors::CSI;
+use nginx_tail::terminal::get_terminal_height;
+use nginx_tail::terminal::get_terminal_width;
 use smol::LocalExecutor;
 use smol::future;
 use smol::{Timer, channel::bounded};
@@ -64,13 +65,9 @@ fn main() {
     let max_runtime: Option<u32> = pargs.opt_value_from_str("--max-runtime").unwrap_or(None);
 
     // TODO: let the user specify --loglines instead: with dynamic tags you don't know the right screenheight
-    let target_height: u16 = pargs.value_from_str("--target-height").unwrap_or_else(|_| {
-        use rustix::termios::tcgetwinsize;
-        match tcgetwinsize(std::io::stderr()) {
-            Ok(x) => x.ws_row,
-            _ => 3,
-        }
-    });
+    let target_height: u16 = pargs
+        .value_from_str("--target-height")
+        .unwrap_or_else(get_terminal_height);
 
     let requested_width: Option<u16> =
         if let Ok(reqwidth) = pargs.value_from_str::<&str, String>("--max-width") {
