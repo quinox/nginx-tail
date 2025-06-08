@@ -67,7 +67,7 @@ fn main() {
     // TODO: let the user specify --loglines instead: with dynamic tags you don't know the right screenheight
     let target_height: u16 = pargs
         .value_from_str("--target-height")
-        .unwrap_or_else(get_terminal_height);
+        .unwrap_or_else(|_| get_terminal_height());
 
     let requested_width: Option<u16> =
         if let Ok(reqwidth) = pargs.value_from_str::<&str, String>("--max-width") {
