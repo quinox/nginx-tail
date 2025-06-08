@@ -150,41 +150,40 @@ pub fn code2color(code: &str) -> ColorStartEnd {
     }
 }
 
-macro_rules! unwrap_or_print_tail_then_return_ok {
-    ($f:expr, $var:expr, $tail:expr) => {
-        if let Some(unwrapped) = $var {
-            unwrapped
-        } else {
-            let _ = write!($f, "{}", $tail);
-            return Ok(());
-        }
-    };
-}
-
 impl Display for ParsedLine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Write all the bits separately, returning early when we run out of bits to print
-        // self.tail will contain any unparsed text, don't forget to print it
+        // self.tail will contain any unparsed text, it should always be printed.
+        macro_rules! unwrap_or_print_tail_then_return_ok {
+            ($var:expr) => {
+                if let Some(unwrapped) = $var {
+                    unwrapped
+                } else {
+                    let _ = write!(f, "{}", &self.tail);
+                    return Ok(());
+                }
+            };
+        }
+
         write!(f, "{}", &self.head)?;
 
-        let head_date = unwrap_or_print_tail_then_return_ok!(f, &self.head_date, &self.tail);
+        let head_date = unwrap_or_print_tail_then_return_ok!(&self.head_date);
         write!(f, "{head_date}{}", &self.date)?;
 
-        let date_method = unwrap_or_print_tail_then_return_ok!(f, &self.date_method, &self.tail);
+        let date_method = unwrap_or_print_tail_then_return_ok!(&self.date_method);
         let (color, reset) = match self.method.as_str() {
             "POST" => (colors::WHITE, colors::RESET),
             _ => ("", ""),
         };
         write!(f, "{date_method}{color}{}{reset}", &self.method)?;
 
-        let method_url = unwrap_or_print_tail_then_return_ok!(f, &self.method_url, &self.tail);
+        let method_url = unwrap_or_print_tail_then_return_ok!(&self.method_url);
         write!(f, "{method_url}{}", &self.url)?;
 
-        let url_lvl = unwrap_or_print_tail_then_return_ok!(f, &self.url_lvl, &self.tail);
+        let url_lvl = unwrap_or_print_tail_then_return_ok!(&self.url_lvl);
         write!(f, "{url_lvl}{}", &self.protocollvl)?;
 
-        let lvl_statuscode =
-            unwrap_or_print_tail_then_return_ok!(f, &self.lvl_statuscode, self.tail);
+        let lvl_statuscode = unwrap_or_print_tail_then_return_ok!(&self.lvl_statuscode);
 
         let (color, reset) = code2color(&self.statuscode);
         write!(
