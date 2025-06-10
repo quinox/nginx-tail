@@ -118,6 +118,7 @@ impl GroupMap {
         self.stats.len()
     }
 
+    #[allow(unused)]
     pub fn is_empty(&self) -> bool {
         self.stats.is_empty()
     }

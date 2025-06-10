@@ -228,7 +228,9 @@ pub async fn follow(
 /// Message to be sent to the processing thread
 #[derive(Debug, PartialEq)]
 pub enum Message {
-    Print,                 // trigger a print
+    Print {
+        include_lines: bool,
+    },
     RegisterGroup(String), // optional; can be used when you know upfront what the tags are
     Line {
         text: String,
@@ -239,16 +241,43 @@ pub enum Message {
     WinCh(u16),
 }
 pub async fn periodic_print(channel: SenderChannel) -> Result<(), Error> {
+    macro_rules! print_stats {
+        () => {
+            channel
+                .send(Message::Print {
+                    include_lines: false,
+                })
+                .await?;
+        };
+    }
+    macro_rules! print_lines {
+        () => {
+            channel
+                .send(Message::Print {
+                    include_lines: true,
+                })
+                .await?;
+        };
+    }
     // update GUI right away
-    channel.send(Message::Print).await?;
     Timer::after(Duration::from_millis(100)).await;
-    channel.send(Message::Print).await?;
+    print_stats!();
     Timer::after(Duration::from_millis(200)).await;
-    channel.send(Message::Print).await?;
+    print_stats!();
     Timer::after(Duration::from_millis(300)).await;
+    print_stats!();
+    Timer::after(Duration::from_millis(500)).await;
+    print_lines!();
+
+    let stats_interval = Duration::from_millis(333);
+    let lines_every_x_stats = 3 * 5; // roughly once every 5 seconds
     loop {
-        channel.send(Message::Print).await?;
-        Timer::after(Duration::from_millis(1000)).await;
+        for _ in 0..lines_every_x_stats {
+            Timer::after(stats_interval).await;
+            print_stats!();
+        }
+        Timer::after(stats_interval).await;
+        print_lines!();
     }
 }
 
@@ -276,12 +305,14 @@ pub async fn fake_slow(channel: SenderChannel) {
 }
 #[cfg(debug_assertions)]
 pub async fn fake_fast(channel: SenderChannel) {
+    let mut j = 0;
     loop {
+        j += 1;
         Timer::after(Duration::from_millis(100)).await;
         for i in 0..100 {
             match channel
                 .send(Message::Line {
-                    text: format!("Fake fast msg {i}"),
+                    text: format!("[{j}] Fake fast msg {i}"),
                     statuscode: Some("200".to_owned()),
                     updowngroup: "generator".to_owned(),
                     leftrightgroup: Some("fake".to_owned()),
@@ -309,7 +340,7 @@ pub async fn process_as_streaming(channel: Receiver<Message>, filters: Vec<Strin
                 #[cfg(debug_assertions)]
                 unreachable!()
             }
-            Ok(Message::Print) => {
+            Ok(Message::Print { include_lines: _ }) => {
                 #[cfg(debug_assertions)]
                 unreachable!()
             }
@@ -354,7 +385,6 @@ pub async fn process_as_tui(
     // of recomputing them every time
     let global_statuscodes = Arc::new(Mutex::new(vec![]));
     let mut groups = GroupMap::new(global_statuscodes.clone());
-    let mut last_gutter_count: u32 = 0;
 
     let mut cut_width = match requested_width {
         None => terminal::get_terminal_width(),
@@ -363,7 +393,8 @@ pub async fn process_as_tui(
 
     println!("{CSI}?25l"); // hide cursor
 
-    let mut lastprinted: String = "".to_owned(); // for optimization we want to minimize printing
+    let mut lastprinted_stats: String = "".to_owned(); // for optimization we want to minimize printing
+    let mut lines_to_wipe = 0;
 
     loop {
         let number_of_lines = target_height - groups.len() as u16 - 2; // we'll try to show the last output line of last time at the top
@@ -387,7 +418,6 @@ pub async fn process_as_tui(
                 statuscode,
             }) => {
                 // accounting
-                // we only expect up to 5 tags so is prolly faster than a hashmap
                 if let Some(leftrightgroup) = leftrightgroup.clone() {
                     let groupstats = groups.get_or_create(updowngroup.clone());
                     let statusstats = groupstats.get_or_create(leftrightgroup).await;
@@ -408,54 +438,44 @@ pub async fn process_as_tui(
                 };
                 pending_lines.push_back((text, leftrightgroup));
             }
-            Ok(Message::Print) => {
-                // Printing to a terminal is _really_ slow, so if our current output
-                // would be the same asthe previous output we'll skip printing at all
-                let mut toflush = "".to_owned();
-                // making space so we can scroll up later without overwriting the old log lines
+            Ok(Message::Print { include_lines }) => {
+                // Printing to a terminal is _really_ slow, so if our current
+                // output would be the same as the previous output we'll skip
+                // printing
+                //
+                // This is getting a little bit tricky because we have 2
+                // different printing modes (with lines and without lines), and
+                // both could end up deciding not to print.
+                let mut toflush_lines = "".to_owned();
+                let mut toflush_stats = "".to_owned();
 
-                toflush += &"\n"
-                    .repeat(groups.len() - last_gutter_count as usize)
-                    .to_string();
-                if groups.is_empty() {
-                    // using CSI<n>A with n = 0 still moves the cursor up
-                    toflush += &format!("\r{CSI}J");
-                } else {
-                    //                     _______________________ move cursor to beginning of line
-                    //                    |        _______________ move cursor up X lines
-                    //                    |       |      _________ clear to end of screen
-                    //          format!(" |       |     |
-                    toflush += &format!("\r{CSI}{}A{CSI}J", groups.len());
-                }
-
-                let samplerate: u32 = match lines_skipped {
-                    0 => 100,
-                    _ => {
-                        (100 * pending_lines.len() as u32)
-                            / (lines_skipped + pending_lines.len() as u32)
+                if include_lines && !pending_lines.is_empty() {
+                    let samplerate: u32 = match lines_skipped {
+                        0 => 100,
+                        _ => {
+                            (100 * pending_lines.len() as u32)
+                                / (lines_skipped + pending_lines.len() as u32)
+                        }
+                    };
+                    for (line, statuscode) in pending_lines.iter() {
+                        let (color, reset) = match statuscode {
+                            None => (colors::ORANGE, colors::RESET),
+                            Some(_) => ("", ""),
+                        };
+                        let trimmed_line = if cut_width != 0 && line.len() > cut_width as usize {
+                            &line[..cut_width as usize]
+                        } else {
+                            &line[..]
+                        };
+                        toflush_lines +=
+                            &format!("{color}{}{reset}\n", parse_nginx_line(trimmed_line));
                     }
-                };
-                if !pending_lines.is_empty() {
-                    // at this point we know for sure we are going to print,
-                    // so we can speed up the has-lastprinted-change-check down below
-                    lastprinted = "".to_owned();
-                }
-                for (line, statuscode) in pending_lines.iter() {
-                    let (color, reset) = match statuscode {
-                        None => (colors::ORANGE, colors::RESET),
-                        Some(_) => ("", ""),
-                    };
-                    let trimmed_line = if cut_width != 0 && line.len() > cut_width as usize {
-                        &line[..cut_width as usize]
-                    } else {
-                        &line[..]
-                    };
-                    toflush += &format!("{color}{}{reset}\n", parse_nginx_line(trimmed_line));
-                }
-                pending_lines.clear();
-                lines_skipped = 0;
+                    pending_lines.clear();
+                    lines_skipped = 0;
 
-                toflush += &format!("-- Output sampled at {samplerate}%");
+                    toflush_lines += &format!("-- Output sampled at {samplerate}%\n");
+                }
+
                 let maxtagname =
                     cmp::max(8, groups.iter().map(|x| x.group.len()).max().unwrap_or(0)); // if we have no tags we don't care about the answer
                 let shared_prefix_len = groups.shared_prefix.len();
@@ -474,7 +494,7 @@ pub async fn process_as_tui(
                                     [shared_prefix_len..groupstats.group.len() - shared_suffix_len]
                                 + &" ".repeat(maxtagname - groupstats.group.len())
                         };
-                    toflush += &format!("\n-- {padded_tag} ");
+                    toflush_stats += &format!("-- {padded_tag} ");
 
                     // This looks a bit messy, but roughly:
                     // * global_statuscodes is a list of all status codes we have seen so far, sorted
@@ -495,7 +515,7 @@ pub async fn process_as_tui(
                             // which is needed for the next iteration
                             let unwrapped = pending_group_statusstat.take().unwrap();
                             let (color, reset) = code2color(&unwrapped.statuscode);
-                            toflush += &format!(
+                            toflush_stats += &format!(
                                 "{:7.1} [{color}{}{reset}] ",
                                 unwrapped.ring.get_speed(),
                                 unwrapped.statuscode,
@@ -503,23 +523,45 @@ pub async fn process_as_tui(
                         } else {
                             #[cfg(debug_assertions)]
                             {
-                                toflush += &format!("{:>7}  {}  ", "", statuscode);
+                                toflush_stats += &format!("{:>7}  {}  ", "", statuscode);
                             }
                             #[cfg(not(debug_assertions))]
                             {
-                                toflush += &format!("{:7}  {}  ", "", " ".repeat(statuscode.len()));
+                                toflush_stats +=
+                                    &format!("{:7}  {}  ", "", " ".repeat(statuscode.len()));
                             }
                         }
                     }
-                    // To test: is it more efficient to spend time printing less characters to the screen?
-                    // it looks neater and reduces chance of line wrapping, at any rate.
-                    toflush.truncate(toflush.trim_end().len());
+                    toflush_stats += "\n";
                 }
-                if toflush != lastprinted {
-                    print!("{toflush}");
-                    lastprinted = toflush;
+                toflush_stats.truncate(toflush_stats.trim_end().len());
+
+                if !toflush_lines.is_empty() || toflush_stats != lastprinted_stats {
+                    // the line "Output sampled at 75%" above the stats should:
+                    // * get wiped when we want to print lines *and* there are lines
+                    // * not get wiped when we want to print lines but there were *no* lines
+                    // * not get wiped when we're only printing stats (the stats don't include this line)
+                    if include_lines {
+                        lines_to_wipe += 1;
+                    }
+
+                    let toflush_wiper = if lines_to_wipe == 0 {
+                        // special case: using CSI<n>A with n = 0 still moves
+                        // the cursor up, and we only want to move to the left
+                        // without moving upwards
+                        &format!("\r{CSI}J")
+                    } else {
+                        //                           _______________________ move cursor to beginning of line
+                        //                          |        _______________ move cursor up X lines
+                        //                          |       |      _________ clear to end of screen
+                        //                format!(" |       |     |
+                        &format!("\r{CSI}{}A{CSI}J", lines_to_wipe)
+                    };
+                    print!("{toflush_wiper}{toflush_lines}{toflush_stats}");
                     std::io::stdout().flush().unwrap();
-                    last_gutter_count = groups.len() as u32;
+
+                    lines_to_wipe = toflush_stats.chars().filter(|x| *x == '\n').count(); // wipe next time
+                    lastprinted_stats = toflush_stats;
                 }
             }
         }
