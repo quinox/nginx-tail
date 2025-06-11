@@ -9,6 +9,7 @@ pub mod colors {
     pub const RED: &str = "\x1b[31m";
     pub const WHITE: &str = "\x1b[1\x1b[37m"; // bright white
     pub const ORANGE: &str = "\x1b[93m"; // bright yellow
+    pub const REVERSE: &str = "\x1b[7m"; // reverse-video (doesn't always work)
     pub const RESET: &str = "\x1b[0m";
 }
 

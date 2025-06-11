@@ -172,7 +172,7 @@ impl Display for ParsedLine {
 
         let date_method = unwrap_or_print_tail_then_return_ok!(&self.date_method);
         let (color, reset) = match self.method.as_str() {
-            "POST" => (colors::WHITE, colors::RESET),
+            "POST" => (colors::REVERSE, colors::RESET),
             _ => ("", ""),
         };
         write!(f, "{date_method}{color}{}{reset}", &self.method)?;
