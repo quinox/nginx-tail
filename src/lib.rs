@@ -3,8 +3,16 @@ mod parsing;
 mod speedometer;
 pub mod terminal;
 
-use collections::GroupMap;
-use parsing::parse_nginx_line;
+use std::cmp;
+use std::collections::VecDeque;
+use std::io::Write as _;
+use std::os::fd::AsRawFd as _;
+use std::sync::Arc;
+use std::vec;
+use std::{fmt::Display, path::PathBuf, time::Duration};
+
+use signal_hook::consts::SIGINT;
+use signal_hook::low_level::raise;
 use smol::channel::SendError;
 use smol::fs::File;
 use smol::fs::read_link;
@@ -15,18 +23,13 @@ use smol::{
     Timer,
     channel::{Receiver, Sender},
 };
-use speedometer::{RingbufferSpeedometer, Speedometer};
-use std::cmp;
-use std::collections::VecDeque;
-use std::io::Write as _;
-use std::os::fd::AsRawFd as _;
-use std::sync::Arc;
-use std::vec;
-use std::{fmt::Display, path::PathBuf, time::Duration};
-use terminal::colors;
-use terminal::colors::CSI;
 
+use crate::collections::GroupMap;
 use crate::parsing::code2color;
+use crate::parsing::parse_nginx_line;
+use crate::speedometer::{RingbufferSpeedometer, Speedometer};
+use crate::terminal::colors;
+use crate::terminal::colors::CSI;
 
 pub fn get_statuscode_class(statuscode: &str) -> Option<String> {
     // As defined in RFC 9110:
@@ -240,6 +243,63 @@ pub enum Message {
     },
     WinCh(u16),
 }
+
+pub async fn keyboard_reader(channel: SenderChannel) -> Result<(), Error> {
+    // NB: We're using tty and not stdin: we want to allow users to pipe
+    // data into the program via stdin still
+
+    // Enabling raw mode is a terminal feature (so we can read single keypresses),
+    // it's independent of opening the tty device.
+    let mut tty = smol::fs::File::open("/dev/tty")
+        .await
+        .map_err(|e| Error(format!("Failed to open /dev/tty: {e:?}")))?;
+
+    eprintln!("[q] to quit, [l] to flush lines, [s] to update stats");
+    loop {
+        let mut buffer = [0; 1];
+        match tty.read(&mut buffer).await {
+            Ok(0) => {
+                // No input, just yield to avoid busy loop
+                eprintln!("No input, waiting...");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+            Ok(_) => {
+                let c = buffer[0] as char;
+                match c {
+                    'q' | 'Q' => {
+                        raise(SIGINT).unwrap(); // to trigger terminal restoration, see sigint_handler
+                    }
+                    's' | 'S' => {
+                        channel
+                            .send(Message::Print {
+                                include_lines: false,
+                            })
+                            .await?;
+                    }
+                    'l' | 'L' => {
+                        channel
+                            .send(Message::Print {
+                                include_lines: true,
+                            })
+                            .await?;
+                    }
+                    _ => {}
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // No input available, just yield
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+            Err(e) => {
+                eprintln!("Error reading from tty: {}", e);
+                return Err(Error(e.to_string()));
+            }
+        }
+    }
+}
+
 pub async fn periodic_print(channel: SenderChannel) -> Result<(), Error> {
     macro_rules! print_stats {
         () => {

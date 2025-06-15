@@ -1,17 +1,3 @@
-use nginx_tail::Error;
-use nginx_tail::Message;
-use nginx_tail::SenderChannel;
-use nginx_tail::follow;
-use nginx_tail::get_statuscode_class;
-use nginx_tail::periodic_print;
-use nginx_tail::process_as_streaming;
-use nginx_tail::process_as_tui;
-use nginx_tail::terminal::colors::CSI;
-use nginx_tail::terminal::get_terminal_height;
-use nginx_tail::terminal::get_terminal_width;
-use smol::LocalExecutor;
-use smol::future;
-use smol::{Timer, channel::bounded};
 use std::fs::read_dir;
 use std::io::IsTerminal;
 use std::process;
@@ -19,6 +5,24 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::vec;
 use std::{path::PathBuf, time::Duration};
+
+use smol::LocalExecutor;
+use smol::future;
+use smol::{Timer, channel::bounded};
+
+use nginx_tail::Error;
+use nginx_tail::Message;
+use nginx_tail::SenderChannel;
+use nginx_tail::follow;
+use nginx_tail::get_statuscode_class;
+use nginx_tail::keyboard_reader;
+use nginx_tail::periodic_print;
+use nginx_tail::process_as_streaming;
+use nginx_tail::process_as_tui;
+use nginx_tail::terminal::DroppableTermios;
+use nginx_tail::terminal::colors::CSI;
+use nginx_tail::terminal::get_terminal_height;
+use nginx_tail::terminal::get_terminal_width;
 
 const HELP: &str = r#"
     Usage:
@@ -162,7 +166,7 @@ async fn sigwinch_handler(channel: SenderChannel) {
     }
 }
 
-async fn sigint_handler() {
+async fn sigint_handler(termios: Option<DroppableTermios>) {
     let terminated = Arc::new(AtomicBool::new(false));
     let Ok(_) = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&terminated))
     else {
@@ -172,6 +176,9 @@ async fn sigint_handler() {
     loop {
         if terminated.load(std::sync::atomic::Ordering::Relaxed) {
             println!("{CSI}?25h\nBye"); // show cursor
+            if let Some(termios) = termios {
+                drop(termios); // restore terminal settings
+            }
             process::exit(0)
         }
         Timer::after(Duration::from_millis(50)).await;
@@ -282,11 +289,14 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
         future::block_on(async_exec.run(process_as_streaming(receiver, args.filters)))
     } else {
         // terminal with live updating stats
-        async_exec.spawn(sigint_handler()).detach();
+        let original = nginx_tail::terminal::activate_raw_mode();
+        async_exec.spawn(sigint_handler(original.ok())).detach();
+
         if args.requested_width.is_none() {
             async_exec.spawn(sigwinch_handler(sender.clone())).detach();
         };
         async_exec.spawn(periodic_print(sender.clone())).detach();
+        async_exec.spawn(keyboard_reader(sender.clone())).detach();
 
         future::block_on(async_exec.run(process_as_tui(
             receiver,
