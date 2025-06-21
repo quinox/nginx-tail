@@ -3,11 +3,14 @@ name = "nginx-tail"
 version = "0.0.1"
 edition = "2024"
 
+[features]
+default = []
+
 [dependencies]
-pico-args = { version = "0.5.0", features = ["eq-separator", "short-space-opt"] }
-rustix = { version = "1.0.7", features = ["termios"] }
-signal-hook = { version = "0.3.18", features = [] }
-smol = "2.0.2"
+pico-args = { version = "0.5.0", default-features = false, features = ["eq-separator", "short-space-opt"] }
+rustix = { version = "1.0.7", default-features = false, features = ["std", "termios"] }
+signal-hook = { version = "0.3.18", default-features = false }
+smol = { version = "2.0.2" , default-features = false }
 
 [profile.profiling]
 # See https://github.com/mstange/samply

@@ -67,14 +67,24 @@ test_shellcheck() {
 	command -v shellcheck >/dev/null || die "Please install shellcheck first: sudo apt install shellcheck"
 
 	# TODO: Check we've tested all Bash scripts
-	bash_scripts=("helpers/helperhelper.sh" "run_tests")
-	found=$(( $(find . -iname '*.sh' | wc --lines) + 1))  # run_tests doesn't end with .sh
-	if [[ "$found" -ne "${#bash_scripts[@]}" ]]
+	bash_scripts=("./helpers/helperhelper.sh" "./run_tests")
+	readarray -t found <<<"$(find . -iname '*.sh' -or -path './run_tests')"
+	if [[ "${#found[@]}" -ne $(( "${#bash_scripts[@]}" )) ]]
 	then
-		>&2 echo "Please update me: you seem to be missing some scripts. You've mentioned ${#bash_scripts[@]} but there appear to be $found"
+		>&2 echo "Please update me: you seem to be missing some scripts. You've said you wanted to test ${#bash_scripts[@]} but I found ${#found[@]}"
+		>&2 echo "You mentioned:"
+		for i in "${bash_scripts[@]}"
+		do
+			>&2 echo "  $i"
+		done
+		>&2 echo "I found:"
+		for i in "${found[@]}"
+		do
+			>&2 echo "  $i"
+		done
 		exit 1
 	fi
-	shellcheck -x helpers/helperhelper.sh run_tests
+	shellcheck -x "${bash_scripts[@]}"
 	>&2 echo "Done"
 }
 
@@ -113,13 +123,45 @@ test_release() {
 	./build_release
 }
 
-test_test() {
+test_cargo_test() {
 	banner "cargo test"
 	cargo test
 }
 
+test_no_default_features() {
+	banner "no default features"
+	deps_using_default_features=$(tq -f Cargo.toml 'dependencies' --output json | jq 'to_entries[] | select(.value."default-features" != false) | .key' | tr '\n' ' ')
+	if [[ "$deps_using_default_features" == "" ]]
+	then
+		>&2 echo "OK, all dependencies have the default features disabled."
+	else
+		>&2 echo "Some packages still use their default features, please disable them in Cargo.toml: $deps_using_default_features"
+		exit 1
+	fi
+}
+
+test_self() {
+	banner "self test"
+
+	functions_mentioned_in_file=$(sed -n '/^test_/ { s/(.*//; p }' "$0" | grep -v '^test_all$' | sort)
+	functions_used_in_test_all=$(sed -n '/^test_all() {/,/^}/ { p }'  "$0" | sed -n '1d; $d; s/^\s*//; /^test_/ { p }' | sort)
+	if ! difference=$(diff --color=always -Nur <(echo "$functions_mentioned_in_file") <(echo "$functions_used_in_test_all"))
+	then
+		>&2 echo "Self test failed: there's a difference between the test functions defined and test functions used within test_all():"
+		>&2 echo "$difference"
+		exit 1
+	fi
+	>&2 echo "All good: all test functions are used within test_all()"
+}
+
 # TODO: Measure their speed and reorder them from fast to slow
 test_all() {
+	test_self
+
+	echo ""
+	test_no_default_features
+	
+	echo ""
 	test_shear
 
 	echo ""
@@ -135,7 +177,7 @@ test_all() {
 	test_markdown
 
 	echo ""
-	test_test
+	test_cargo_test
 
 	echo ""
 	test_release
