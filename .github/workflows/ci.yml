@@ -84,4 +84,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: cargo install tomlq
       - run: ./run_tests no_default_features
