@@ -1,0 +1,103 @@
+#!/bin/bash
+set -eu
+cd "$(dirname "$0")"
+source helpers/helperhelper.sh
+
+wait_for_backgrounded_cargo() {
+	# for whatever reason it appears cargo sometimes backgrounds parts of itself,
+	# and it messes with our git state
+	guard=100
+	while [[ "$guard" -gt 0 ]] && ps aux | grep 'carg[o]'
+	do
+		echo "... $guard"
+		guard=$(( guard - 1 ))
+		sleep 0.1s
+	done
+	if [[ "$guard" -eq 0 ]]
+	then
+		die "There is still a cargo running in the background."
+	fi
+	sleep 1s
+}
+
+_cargo() {
+	cargo "$@"
+	wait_for_backgrounded_cargo
+}
+
+[[ -n "$(git status --porcelain)" ]] && die "Your working dir is in a dirty state; please fix that first"
+unpushed_before=$(git log @{upstream}.. --oneline | wc -l)
+wait_for_backgrounded_cargo
+
+rm -R vendor || true
+rm -R vendor_before || true
+rm -R vendor_after_update || true
+rm -R vendor_after_upgrade || true
+
+_cargo vendor
+
+mv vendor vendor_before
+
+_cargo update
+
+if [[ -n "$(git status --porcelain Cargo.lock)" ]]
+then
+	>&2 echo "cargo-update had an effect"
+	git add Cargo.lock
+	if ! ./run_tests
+	then
+		die "Please fix these issues and commit: git commit -m 'cargo update'"
+	fi
+	git commit -m "cargo update"
+
+	_cargo vendor
+	mv vendor vendor_after_update
+else
+	>&2 echo "cargo-update did not update anything"
+fi
+
+_cargo upgrade
+
+
+if [[ -n "$(git status --porcelain Cargo.toml)" ]]
+then
+	>&2 echo "cargo-upgrade had an effect"
+	if ! ./run_tests
+	then
+		die "Please fix these issues and commit: git commit -m 'cargo upgrade'"
+	fi
+	git add Cargo.toml Cargo.lock
+	git commit -m "cargo upgrade"
+	_cargo vendor
+	mv vendor vendor_after_upgrade
+else
+	>&2 echo "cargo-upgrade did not upgrade anything"
+fi
+	
+>&2 echo -e "\n\n"
+
+diff_before="diff -Nur --color=always"
+diff_after=" | less -R"
+
+du -sh vendor*
+if [[ -e "vendor_after_update" ]]
+then
+	>&2 echo "To see the minor changes: $diff_before vendor_before vendor_after_update $diff_after"
+	if [[ -e "vendor_after_upgrade" ]]
+	then
+		>&2 echo "To see the major changes: $diff_before vendor_after_update vendor_after_update $diff_after"
+	fi
+elif [[ -e "vendor_after_upgrade" ]]
+then
+	>&2 echo "To see the major changes: $diff_before vendor_before vendor_after_upgrade $diff_after"
+fi
+
+>&2 echo ""
+
+unpushed_after=$(git log @{upstream}.. --oneline | wc -l)
+if [[ "$unpushed_after" != "$unpushed_before" ]]
+then
+	>&2 echo "You now have $(( unpushed_after - unpushed_before )) new unpushed commits"
+	git log @{upstream}.. --oneline
+fi
+>&2 echo "All done."

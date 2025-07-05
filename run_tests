@@ -67,9 +67,8 @@ test_shellcheck() {
 	banner "ShellCheck"
 	command -v shellcheck >/dev/null || die "Please install shellcheck first: sudo apt install shellcheck"
 
-	# TODO: Check we've tested all Bash scripts
 	bash_scripts=("./helpers/helperhelper.sh" "./run_tests")
-	readarray -t found <<<"$(find . -iname '*.sh' -or -path './run_tests')"
+	readarray -t found <<<"$(find . -type d -name 'vendor*' -prune -or '(' -type f -iname '*.sh' -or -path './run_tests' ')' -print)"
 	if [[ "${#found[@]}" -ne $(( "${#bash_scripts[@]}" )) ]]
 	then
 		>&2 echo "Please update me: you seem to be missing some scripts. You've said you wanted to test ${#bash_scripts[@]} but I found ${#found[@]}"
