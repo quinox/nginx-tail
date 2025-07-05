@@ -293,7 +293,7 @@ pub async fn keyboard_reader(channel: SenderChannel) -> Result<(), Error> {
                 continue;
             }
             Err(e) => {
-                eprintln!("Error reading from tty: {}", e);
+                eprintln!("Error reading from tty: {e}");
                 return Err(Error(e.to_string()));
             }
         }
@@ -611,11 +611,11 @@ pub async fn process_as_tui(
                         // without moving upwards
                         &format!("\r{CSI}J")
                     } else {
-                        //                           _______________________ move cursor to beginning of line
-                        //                          |        _______________ move cursor up X lines
-                        //                          |       |      _________ clear to end of screen
-                        //                format!(" |       |     |
-                        &format!("\r{CSI}{}A{CSI}J", lines_to_wipe)
+                        //          ____________________________________ move cursor to beginning of line
+                        //         |                     _______________ move cursor up X lines
+                        //         |                    |      _________ clear to end of screen
+                        //ormat!(" |                    |     |
+                        &format!("\r{CSI}{lines_to_wipe}A{CSI}J")
                     };
                     print!("{toflush_wiper}{toflush_lines}{toflush_stats}");
                     std::io::stdout().flush().unwrap();
