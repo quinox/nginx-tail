@@ -36,7 +36,7 @@ const HELP: &str = r#"
                                  Will be met if the log lines fit in the width of your terminal
             --max-runtime X      Terminate after X seconds
             --combine            Combine stats of all files together
-            --merge              Combine http statuscodes in groups
+            --unmerge            Do not group http statuscodes
             --filter X           Only show log lines matching this status code.
                                  Can be used multiple times, "4xx" can be used to show 403, 404 etc.
                                  The statistics are not affected by this option.
@@ -84,7 +84,7 @@ fn main() {
         };
 
     let combine_filestats: bool = pargs.contains("--combine");
-    let merge_statuscodes: bool = pargs.contains("--merge");
+    let merge_statuscodes: bool = !pargs.contains("--unmerge");
 
     let mut filters = vec![];
     while let Ok(filter) = pargs.value_from_str::<&str, String>("--filter") {
