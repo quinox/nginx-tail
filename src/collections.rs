@@ -89,10 +89,11 @@ impl GroupStats {
         self.stats.iter()
     }
     pub fn last_activity(&self) -> Option<u64> {
-        match self.stats.iter().map(|f| f.last_activity).max() {
-            None => None,
-            Some(instant) => Some(instant.elapsed().as_secs()),
-        }
+        self.stats
+            .iter()
+            .map(|f| f.last_activity)
+            .max()
+            .map(|i| i.elapsed().as_secs())
     }
 }
 

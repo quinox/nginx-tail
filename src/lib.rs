@@ -545,7 +545,7 @@ pub async fn process_as_tui(
                 for groupstats in groups.iter_mut() {
                     groupstats.process();
                     // never hide the anymous catch-all group
-                    if groupstats.group != "" {
+                    if !groupstats.group.is_empty() {
                         match groupstats.last_activity() {
                             Some(secs_ago) => {
                                 if secs_ago > 60 {
