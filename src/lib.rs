@@ -349,9 +349,9 @@ pub async fn fake_slow(channel: SenderChannel) {
         match channel
             .send(Message::Line {
                 text: format!("Fake slow msg {counter}"),
-                statuscode: Some("slow".to_owned()),
-                updowngroup: "generator".to_owned(),
-                leftrightgroup: Some("200".to_owned()),
+                statuscode: Some("200".to_owned()),
+                updowngroup: "slow-generator".to_owned(),
+                leftrightgroup: Some("fake".to_owned()),
             })
             .await
         {
@@ -374,7 +374,7 @@ pub async fn fake_fast(channel: SenderChannel) {
                 .send(Message::Line {
                     text: format!("[{j}] Fake fast msg {i}"),
                     statuscode: Some("200".to_owned()),
-                    updowngroup: "generator".to_owned(),
+                    updowngroup: "fast-generator".to_owned(),
                     leftrightgroup: Some("fake".to_owned()),
                 })
                 .await
