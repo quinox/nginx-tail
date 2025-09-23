@@ -7,6 +7,7 @@ use crate::{RingbufferSpeedometer, Speedometer as _};
 pub struct StatusStats {
     pub statuscode: String,
     start: std::time::Instant,
+    last_activity: std::time::Instant,
     pub pending: u32, // pending since start
     pub ring: RingbufferSpeedometer,
 }
@@ -16,6 +17,7 @@ impl StatusStats {
         Self {
             statuscode,
             start: std::time::Instant::now(),
+            last_activity: std::time::Instant::now(),
             pending: 0,
             ring: RingbufferSpeedometer::new(5),
         }
@@ -26,8 +28,11 @@ impl StatusStats {
             return;
         }
         self.ring.add_measurement(elapsed, self.pending);
-        self.start = std::time::Instant::now();
+        if self.pending != 0 {
+            self.last_activity = std::time::Instant::now();
+        }
         self.pending = 0;
+        self.start = std::time::Instant::now();
     }
 }
 
@@ -82,6 +87,12 @@ impl GroupStats {
     }
     pub fn iter(&mut self) -> impl Iterator<Item = &StatusStats> {
         self.stats.iter()
+    }
+    pub fn last_activity(&self) -> Option<u64> {
+        match self.stats.iter().map(|f| f.last_activity).max() {
+            None => None,
+            Some(instant) => Some(instant.elapsed().as_secs()),
+        }
     }
 }
 
