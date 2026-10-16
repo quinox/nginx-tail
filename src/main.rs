@@ -303,7 +303,7 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
             args.target_height,
             args.requested_width,
             args.filters,
-        )));
+        )))?;
     }
 
     Ok(())

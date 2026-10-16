@@ -437,7 +437,7 @@ pub async fn process_as_tui(
     target_height: u16,
     requested_width: Option<u16>,
     filters: Vec<String>,
-) {
+) -> Result<(), Error> {
     let mut pending_lines: VecDeque<(String, Option<String>)> =
         VecDeque::with_capacity(target_height as usize);
     let mut lines_skipped: u32 = 0;
@@ -457,11 +457,14 @@ pub async fn process_as_tui(
     let mut lines_to_wipe = 0;
 
     loop {
-        let number_of_lines = target_height - groups.len() as u16 - 2; // we'll try to show the last output line of last time at the top
+        // Besides the log lines we need a line per group, a line for "Output
+        // sampled at" and we'll try to show the last output line of last time at the top
+        let needed = groups.len() as u16 + 2;
+        let number_of_lines = target_height.saturating_sub(needed);
         match channel.recv().await {
             Err(_) => {
                 eprintln!("Channel closed.");
-                return;
+                return Ok(());
             }
             Ok(Message::WinCh(new_terminal_width)) => {
                 // we only connect the sigwinch handler when the user did not specify a width,
@@ -499,6 +502,16 @@ pub async fn process_as_tui(
                 pending_lines.push_back((text, leftrightgroup));
             }
             Ok(Message::Print { include_lines }) => {
+                // Checked here instead of at the top of the loop: by now the
+                // groups have been registered, so we know how much we need
+                if number_of_lines == 0 {
+                    println!("{CSI}?25h"); // show cursor
+                    return Err(Error(format!(
+                        "Not enough space to draw the UI: need at least {} rows, have {target_height} (see --target-height)",
+                        needed + 1
+                    )));
+                }
+
                 // Printing to a terminal is _really_ slow, so if our current
                 // output would be the same as the previous output we'll skip
                 // printing
