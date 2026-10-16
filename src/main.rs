@@ -138,7 +138,10 @@ fn main() {
 
     match smol::block_on(innermain(args)) {
         Ok(_) => {}
-        Err(ex) => eprintln!("{ex}"),
+        Err(ex) => {
+            eprintln!("{ex}");
+            process::exit(1);
+        }
     }
 }
 
