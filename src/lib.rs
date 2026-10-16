@@ -259,10 +259,9 @@ pub async fn keyboard_reader(channel: SenderChannel) -> Result<(), Error> {
         let mut buffer = [0; 1];
         match tty.read(&mut buffer).await {
             Ok(0) => {
-                // No input, just yield to avoid busy loop
-                eprintln!("No input, waiting...");
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                continue;
+                // EOF: the terminal is gone (hangup), there will be no more
+                // keypresses. Retrying would loop forever.
+                return Ok(());
             }
             Ok(_) => {
                 let c = buffer[0] as char;
@@ -288,8 +287,9 @@ pub async fn keyboard_reader(channel: SenderChannel) -> Result<(), Error> {
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // No input available, just yield
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                // No input available. NB: don't use std::thread::sleep here,
+                // it would block every other task on the executor
+                Timer::after(Duration::from_millis(10)).await;
                 continue;
             }
             Err(e) => {
