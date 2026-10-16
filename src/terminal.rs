@@ -39,7 +39,8 @@ pub struct DroppableTermios(Termios);
 impl Drop for DroppableTermios {
     fn drop(&mut self) {
         let fd = std::io::stdout();
-        tcsetattr(fd, OptionalActions::Now, &self.0).unwrap();
+        // fails when the terminal is gone, in which case there's nothing to restore
+        let _ = tcsetattr(fd, OptionalActions::Now, &self.0);
     }
 }
 
