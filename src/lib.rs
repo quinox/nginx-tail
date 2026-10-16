@@ -6,7 +6,9 @@ pub mod terminal;
 use std::cmp;
 use std::collections::VecDeque;
 use std::io::Write as _;
+use std::os::fd::AsFd as _;
 use std::os::fd::AsRawFd as _;
+use std::os::unix::fs::FileTypeExt as _;
 use std::sync::Arc;
 use std::vec;
 use std::{fmt::Display, path::PathBuf, time::Duration};
@@ -244,6 +246,27 @@ pub enum Message {
     WinCh(u16),
 }
 
+/// Whether data is being piped into us, like `tail -f access.log | nginx-tail`
+fn stdin_is_pipe() -> bool {
+    std::io::stdin()
+        .as_fd()
+        .try_clone_to_owned()
+        .and_then(|fd| std::fs::File::from(fd).metadata())
+        .is_ok_and(|meta| meta.file_type().is_fifo())
+}
+
+/// The terminal hung up: there will be no more keypresses
+fn keyboard_gone() -> Result<(), Error> {
+    if !stdin_is_pipe() {
+        // Our output went to that terminal too, nothing left to do.
+        // Quit the same way 'q' does, see sigint_handler
+        raise(SIGINT).unwrap();
+    }
+    // Data is being piped into us: keep processing it, just without
+    // keyboard input
+    Ok(())
+}
+
 pub async fn keyboard_reader(channel: SenderChannel) -> Result<(), Error> {
     // NB: We're using tty and not stdin: we want to allow users to pipe
     // data into the program via stdin still
@@ -259,9 +282,8 @@ pub async fn keyboard_reader(channel: SenderChannel) -> Result<(), Error> {
         let mut buffer = [0; 1];
         match tty.read(&mut buffer).await {
             Ok(0) => {
-                // EOF: the terminal is gone (hangup), there will be no more
-                // keypresses. Retrying would loop forever.
-                return Ok(());
+                // EOF: the terminal is gone. Retrying would loop forever.
+                return keyboard_gone();
             }
             Ok(_) => {
                 let c = buffer[0] as char;
@@ -291,6 +313,11 @@ pub async fn keyboard_reader(channel: SenderChannel) -> Result<(), Error> {
                 // it would block every other task on the executor
                 Timer::after(Duration::from_millis(10)).await;
                 continue;
+            }
+            Err(e) if e.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()) => {
+                // A read that was in progress when the terminal hung up
+                // gets EIO, later reads get EOF
+                return keyboard_gone();
             }
             Err(e) => {
                 eprintln!("Error reading from tty: {e}");

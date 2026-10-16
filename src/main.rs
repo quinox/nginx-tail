@@ -1,5 +1,6 @@
 use std::fs::read_dir;
 use std::io::IsTerminal;
+use std::io::Write as _;
 use std::process;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -175,7 +176,8 @@ async fn sigint_handler(termios: Option<DroppableTermios>) {
     };
     loop {
         if terminated.load(std::sync::atomic::Ordering::Relaxed) {
-            println!("{CSI}?25h\nBye"); // show cursor
+            // show cursor. NB: not println!, which panics when the terminal is gone
+            let _ = writeln!(std::io::stdout(), "{CSI}?25h\nBye");
             if let Some(termios) = termios {
                 drop(termios); // restore terminal settings
             }
