@@ -279,8 +279,7 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
         }
     }
 
-    if args.max_runtime.is_some() {
-        let max_runtime = args.max_runtime.unwrap();
+    if let Some(max_runtime) = args.max_runtime {
         async_exec
             .spawn(async move {
                 Timer::after(Duration::from_secs(max_runtime.into())).await;
