@@ -165,23 +165,23 @@ impl Display for ParsedLine {
             };
         }
 
-        write!(f, "{}", &self.head)?;
+        write!(f, "{}", self.head)?;
 
         let head_date = unwrap_or_print_tail_then_return_ok!(&self.head_date);
-        write!(f, "{head_date}{}", &self.date)?;
+        write!(f, "{head_date}{}", self.date)?;
 
         let date_method = unwrap_or_print_tail_then_return_ok!(&self.date_method);
         let (color, reset) = match self.method.as_str() {
             "POST" => (colors::REVERSE, colors::RESET),
             _ => ("", ""),
         };
-        write!(f, "{date_method}{color}{}{reset}", &self.method)?;
+        write!(f, "{date_method}{color}{}{reset}", self.method)?;
 
         let method_url = unwrap_or_print_tail_then_return_ok!(&self.method_url);
-        write!(f, "{method_url}{}", &self.url)?;
+        write!(f, "{method_url}{}", self.url)?;
 
         let url_lvl = unwrap_or_print_tail_then_return_ok!(&self.url_lvl);
-        write!(f, "{url_lvl}{}", &self.protocollvl)?;
+        write!(f, "{url_lvl}{}", self.protocollvl)?;
 
         let lvl_statuscode = unwrap_or_print_tail_then_return_ok!(&self.lvl_statuscode);
 
@@ -189,7 +189,7 @@ impl Display for ParsedLine {
         write!(
             f,
             "{lvl_statuscode}{color}{}{reset}{}",
-            &self.statuscode, &self.tail,
+            self.statuscode, self.tail,
         )
     }
 }
