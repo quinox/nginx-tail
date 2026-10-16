@@ -100,7 +100,11 @@ struct LineReader {
 
 impl LineReader {
     async fn new(filename: PathBuf) -> Result<Self, String> {
-        let file = Self::_open_file(filename.clone()).await?;
+        let mut file = Self::_open_file(filename.clone()).await?;
+        // we're only interested in new lines
+        if file.seek(std::io::SeekFrom::End(0)).await.is_err() {
+            return Err("Error seeking to end of file".into());
+        }
         Ok(LineReader {
             filename,
             file,
@@ -110,13 +114,9 @@ impl LineReader {
     }
 
     async fn _open_file(filename: PathBuf) -> Result<File, String> {
-        let mut file = smol::fs::File::open(&filename)
+        smol::fs::File::open(&filename)
             .await
-            .map_err(|e| e.to_string())?;
-        if file.seek(std::io::SeekFrom::End(0)).await.is_err() {
-            return Err("Error seeking to end of file".into());
-        }
-        Ok(file)
+            .map_err(|e| e.to_string())
     }
 
     /// Whether our filename now points to a different file than the one we
@@ -143,6 +143,8 @@ impl LineReader {
                     true => Self::_open_file(self.filename.clone()).await.ok(),
                 };
                 match reopened {
+                    // A rotated file is read from the start, so we don't miss
+                    // what was written to it before we noticed the rotation
                     Some(file) => {
                         self.file = file;
                         self.pending.clear();
@@ -989,11 +991,17 @@ mod tests {
                 "read_lines() at EOF of a rotated file returned without waiting"
             );
 
-            // Once the new file shows up we should switch to it
-            File::create(&tmpfile.filename).unwrap();
+            // Once the new file shows up we should switch to it, and not miss
+            // what was written to it before we noticed
+            let mut new_file = File::create(&tmpfile.filename).unwrap();
+            new_file.write_all(b"first line after rotation\n").unwrap();
             assert!(reader.rotated().await);
             assert_eq!(reader.read_lines().await, Ok(vec![]));
             assert!(!reader.rotated().await);
+            assert_eq!(
+                reader.read_lines().await,
+                Ok(vec!["first line after rotation".to_owned()])
+            );
 
             let _ = remove_file(symlink);
             let _ = remove_file(rotated);
