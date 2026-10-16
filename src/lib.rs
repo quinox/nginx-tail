@@ -7,8 +7,8 @@ use std::cmp;
 use std::collections::VecDeque;
 use std::io::Write as _;
 use std::os::fd::AsFd as _;
-use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::FileTypeExt as _;
+use std::os::unix::fs::MetadataExt as _;
 use std::sync::Arc;
 use std::vec;
 use std::{fmt::Display, path::PathBuf, time::Duration};
@@ -17,7 +17,6 @@ use signal_hook::consts::SIGINT;
 use signal_hook::low_level::raise;
 use smol::channel::SendError;
 use smol::fs::File;
-use smol::fs::read_link;
 use smol::io::AsyncReadExt as _;
 use smol::io::AsyncSeekExt as _;
 use smol::lock::Mutex;
@@ -94,7 +93,6 @@ pub type SenderChannel = Sender<Message>;
 
 struct LineReader {
     filename: PathBuf,
-    fd_path: PathBuf,
     file: File,       // the file handle
     pending: Vec<u8>, // data that was read but not yet processed
     readbuf: Vec<u8>,
@@ -102,47 +100,58 @@ struct LineReader {
 
 impl LineReader {
     async fn new(filename: PathBuf) -> Result<Self, String> {
-        let (file, fd_path) = Self::_open_file(filename.clone()).await?;
+        let file = Self::_open_file(filename.clone()).await?;
         Ok(LineReader {
             filename,
-            fd_path,
             file,
             pending: vec![],
             readbuf: vec![0; 1024],
         })
     }
 
-    async fn _open_file(filename: PathBuf) -> Result<(File, PathBuf), String> {
-        // open the file and get the /proc/self/fd/<fd> path
+    async fn _open_file(filename: PathBuf) -> Result<File, String> {
         let mut file = smol::fs::File::open(&filename)
             .await
             .map_err(|e| e.to_string())?;
         if file.seek(std::io::SeekFrom::End(0)).await.is_err() {
             return Err("Error seeking to end of file".into());
         }
-        let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
-        Ok((file, fd_path))
+        Ok(file)
+    }
+
+    /// Whether our filename now points to a different file than the one we
+    /// have open, i.e. the log got rotated and a new file has been created.
+    ///
+    /// We compare inodes instead of paths: paths can be relative or contain
+    /// symlinks, and this doesn't depend on /proc being available.
+    async fn rotated(&self) -> bool {
+        let Ok(current) = self.file.metadata().await else {
+            return false;
+        };
+        let Ok(on_disk) = smol::fs::metadata(&self.filename).await else {
+            // nothing at our filename (yet), so nothing to switch to
+            return false;
+        };
+        (current.dev(), current.ino()) != (on_disk.dev(), on_disk.ino())
     }
 
     async fn read_lines(&mut self) -> Result<Vec<String>, ()> {
         match self.file.read(&mut self.readbuf).await {
             Ok(0) => {
-                // Did the file get rotated perhaps?
-
-                // read_link operates on a virtual filesystem so it should be pretty fast
-                let current_filename = read_link(self.fd_path.clone())
-                    .await
-                    .unwrap_or_else(|_| PathBuf::new());
-                if current_filename != self.filename {
-                    // yes, it did! Let's try to open the new file
-                    if let Ok((file, fd_path)) = Self::_open_file(self.filename.clone()).await {
+                let reopened = match self.rotated().await {
+                    false => None,
+                    true => Self::_open_file(self.filename.clone()).await.ok(),
+                };
+                match reopened {
+                    Some(file) => {
                         self.file = file;
-                        self.fd_path = fd_path;
                         self.pending.clear();
                     }
-                } else {
-                    // no, the file is still the same. Let's wait a bit before trying again
-                    Timer::after(Duration::from_millis(50)).await;
+                    None => {
+                        // Nothing new. Let's wait a bit before trying again;
+                        // without this wait follow() would spin at 100% CPU
+                        Timer::after(Duration::from_millis(50)).await;
+                    }
                 }
                 Ok(vec![])
             }
@@ -780,6 +789,7 @@ pub async fn process_as_tui(
 #[cfg(test)]
 mod tests {
     use crate::Layout;
+    use crate::LineReader;
     use crate::Message;
     use crate::follow;
     use crate::get_statuscode_class;
@@ -792,6 +802,7 @@ mod tests {
     use std::process::Command;
     use std::str::from_utf8;
     use std::time::Duration;
+    use std::time::Instant;
     use std::{fs::File, io::Write};
 
     struct TempFile {
@@ -948,6 +959,45 @@ mod tests {
             );
             assert!(receiver.try_recv().is_err());
         }));
+    }
+
+    #[test]
+    fn test_no_busyloop_at_eof() {
+        future::block_on(async {
+            let tmpfile = TempFile::new();
+            let symlink = format!("{}.symlink", tmpfile.filename);
+            let rotated = format!("{}.1", tmpfile.filename);
+            std::os::unix::fs::symlink(&tmpfile.filename, &symlink).unwrap();
+
+            // A symlinked path doesn't match what /proc/self/fd/N points to,
+            // which used to be mistaken for a rotation at every EOF
+            let mut reader = LineReader::new(symlink.clone().into()).await.unwrap();
+            let start = Instant::now();
+            assert_eq!(reader.read_lines().await, Ok(vec![]));
+            assert!(
+                start.elapsed() >= Duration::from_millis(40),
+                "read_lines() at EOF returned without waiting"
+            );
+
+            // Rotated away, but no new file has been created yet
+            std::fs::rename(&tmpfile.filename, &rotated).unwrap();
+            assert!(!reader.rotated().await);
+            let start = Instant::now();
+            assert_eq!(reader.read_lines().await, Ok(vec![]));
+            assert!(
+                start.elapsed() >= Duration::from_millis(40),
+                "read_lines() at EOF of a rotated file returned without waiting"
+            );
+
+            // Once the new file shows up we should switch to it
+            File::create(&tmpfile.filename).unwrap();
+            assert!(reader.rotated().await);
+            assert_eq!(reader.read_lines().await, Ok(vec![]));
+            assert!(!reader.rotated().await);
+
+            let _ = remove_file(symlink);
+            let _ = remove_file(rotated);
+        });
     }
 
     fn layout(stats_rows: u16, groups_shown: u16, number_of_lines: u16) -> Layout {
