@@ -10,7 +10,9 @@ report, ideas and feature requests.
 
 ## Screenshots
 
-todo
+![nginx-tail following the logs of a few busy sites](screenshot.svg)
+
+Regenerate it with `./make_screenshot.py` (needs `tmux`).
 
 ## Quickstart
 
