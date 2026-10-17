@@ -243,7 +243,7 @@ pub enum Message {
         leftrightgroup: Option<String>, // either 200,403,404 or 2xx,4xx
         statuscode: Option<String>, // 200, 403, 404
     },
-    WinCh(u16),
+    WinCh(u16, u16), // new terminal width and height
 }
 
 /// Whether data is being piped into us, like `tail -f access.log | nginx-tail`
@@ -423,7 +423,7 @@ pub async fn process_as_streaming(channel: Receiver<Message>, filters: Vec<Strin
                 eprintln!("Channel closed");
                 return;
             }
-            Ok(Message::WinCh(_)) => {
+            Ok(Message::WinCh(_, _)) => {
                 #[cfg(debug_assertions)]
                 unreachable!()
             }
@@ -454,17 +454,95 @@ pub async fn process_as_streaming(channel: Receiver<Message>, filters: Vec<Strin
     }
 }
 
+/// How the rows of the screen are divided
+#[derive(Debug, PartialEq)]
+struct Layout {
+    stats_rows: u16,   // rows used by per-file stats, including the "... and X more" row
+    groups_shown: u16, // groups that get a row of their own
+    number_of_lines: u16, // rows left for log lines, 0 if the UI doesn't fit
+}
+
+impl Layout {
+    /// requested_file_rows:
+    /// Some(x) = at most x rows for the per-file stats
+    /// None    = at most half of the screen
+    fn new(target_height: u16, requested_file_rows: Option<u16>, groups: usize) -> Self {
+        let max_rows = requested_file_rows.unwrap_or(cmp::max(1, target_height / 2));
+        let groups = u16::try_from(groups).unwrap_or(u16::MAX);
+        let (stats_rows, groups_shown) = if groups <= max_rows {
+            (groups, groups)
+        } else {
+            // the last row says how many groups we're not showing
+            (max_rows, max_rows - 1)
+        };
+        // Besides the log lines and the stats we need a line for "Output
+        // sampled at" and we'll try to show the last output line of last time at the top
+        let number_of_lines = target_height.saturating_sub(stats_rows.saturating_add(2));
+        Self {
+            stats_rows,
+            groups_shown,
+            number_of_lines,
+        }
+    }
+}
+
+/// A shown group is only replaced by a hidden group that was active at least
+/// this many seconds more recently, so the list doesn't flicker
+const SWAP_AFTER_SECS: u64 = 5;
+
+/// Picks which groups get a row, preferring the ones with the most recent writes.
+///
+/// last_activity: seconds since the last write of each group (None = never)
+/// previous:      indexes of the groups that were shown last time
+///
+/// Returns the indexes of the groups to show, in their original order.
+fn pick_groups(last_activity: &[Option<u64>], previous: &[usize], count: usize) -> Vec<usize> {
+    let secs_ago = |index: &usize| last_activity[*index].unwrap_or(u64::MAX);
+    let (mut shown, mut hidden): (Vec<usize>, Vec<usize>) =
+        (0..last_activity.len()).partition(|index| previous.contains(index));
+    // most recently active first
+    shown.sort_by_key(secs_ago);
+    hidden.sort_by_key(secs_ago);
+
+    shown.truncate(count);
+    let missing = cmp::min(count.saturating_sub(shown.len()), hidden.len());
+    shown.extend(hidden.drain(..missing));
+    shown.sort_by_key(secs_ago);
+
+    // swap the least active shown groups for clearly more active hidden ones
+    for (hidden_index, shown_index) in hidden.iter().zip(shown.iter_mut().rev()) {
+        if secs_ago(hidden_index).saturating_add(SWAP_AFTER_SECS) < secs_ago(shown_index) {
+            *shown_index = *hidden_index;
+        } else {
+            break;
+        }
+    }
+    shown.sort();
+    shown
+}
+
+///
+/// requested_height:
+/// Some(x) = use x rows
+/// None    = use screen's height    -- sigwinch handler installed
 ///
 /// requested_width:
-/// Some(0) = unlimited line length  -- no sigwinch handler installed
-/// Some(x) = cut off at x           -- no sigwinch handler installed
+/// Some(0) = unlimited line length  -- no sigwinch handler installed (unless requested_height is None)
+/// Some(x) = cut off at x           -- no sigwinch handler installed (unless requested_height is None)
 /// None    = use screen's width     -- sigwinch handler installed
+///
+/// requested_file_rows: see Layout::new
 pub async fn process_as_tui(
     channel: Receiver<Message>,
-    target_height: u16,
+    requested_height: Option<u16>,
     requested_width: Option<u16>,
+    requested_file_rows: Option<u16>,
     filters: Vec<String>,
 ) -> Result<(), Error> {
+    let mut target_height = match requested_height {
+        None => terminal::get_terminal_height(),
+        Some(x) => x,
+    };
     let mut pending_lines: VecDeque<(String, Option<String>)> =
         VecDeque::with_capacity(target_height as usize);
     let mut lines_skipped: u32 = 0;
@@ -482,21 +560,25 @@ pub async fn process_as_tui(
 
     let mut lastprinted_stats: String = "".to_owned(); // for optimization we want to minimize printing
     let mut lines_to_wipe = 0;
+    let mut shown_groups: Vec<usize> = vec![]; // indexes into groups
 
     loop {
-        // Besides the log lines we need a line per group, a line for "Output
-        // sampled at" and we'll try to show the last output line of last time at the top
-        let needed = groups.len() as u16 + 2;
-        let number_of_lines = target_height.saturating_sub(needed);
+        let layout = Layout::new(target_height, requested_file_rows, groups.len());
+        let number_of_lines = layout.number_of_lines;
         match channel.recv().await {
             Err(_) => {
                 eprintln!("Channel closed.");
                 return Ok(());
             }
-            Ok(Message::WinCh(new_terminal_width)) => {
-                // we only connect the sigwinch handler when the user did not specify a width,
-                // so every WinCh signal we see meant we have to change our width
-                cut_width = new_terminal_width;
+            Ok(Message::WinCh(new_terminal_width, new_terminal_height)) => {
+                // the sigwinch handler is connected when the user did not specify
+                // a width or a height: only follow the screen for what wasn't specified
+                if requested_width.is_none() {
+                    cut_width = new_terminal_width;
+                }
+                if requested_height.is_none() {
+                    target_height = new_terminal_height;
+                }
             }
             Ok(Message::RegisterGroup(tag)) => {
                 let _ = groups.get_or_create(tag);
@@ -522,10 +604,11 @@ pub async fn process_as_tui(
                         continue;
                     }
                 }
-                if pending_lines.len() >= number_of_lines.into() {
+                // NB: a loop, the number of lines shrinks when the terminal gets smaller
+                while !pending_lines.is_empty() && pending_lines.len() >= number_of_lines.into() {
                     pending_lines.pop_front();
                     lines_skipped += 1;
-                };
+                }
                 pending_lines.push_back((text, leftrightgroup));
             }
             Ok(Message::Print { include_lines }) => {
@@ -534,8 +617,8 @@ pub async fn process_as_tui(
                 if number_of_lines == 0 {
                     println!("{CSI}?25h"); // show cursor
                     return Err(Error(format!(
-                        "Not enough space to draw the UI: need at least {} rows, have {target_height} (see --target-height)",
-                        needed + 1
+                        "Not enough space to draw the UI: won't fit on screen, need at least {} rows, have {target_height} (see --target-height and --file-rows)",
+                        layout.stats_rows as u32 + 3
                     )));
                 }
 
@@ -584,6 +667,18 @@ pub async fn process_as_tui(
 
                 for groupstats in groups.iter_mut() {
                     groupstats.process();
+                }
+                // when there are more groups than rows we show the most active ones
+                let last_activity: Vec<Option<u64>> =
+                    groups.iter().map(|x| x.last_activity()).collect();
+                shown_groups =
+                    pick_groups(&last_activity, &shown_groups, layout.groups_shown.into());
+                let groups_hidden = groups.len() - shown_groups.len();
+
+                for (index, groupstats) in groups.iter_mut().enumerate() {
+                    if !shown_groups.contains(&index) {
+                        continue;
+                    }
                     // never hide the anymous catch-all group
                     if !groupstats.group.is_empty() {
                         match groupstats.last_activity() {
@@ -645,6 +740,9 @@ pub async fn process_as_tui(
                     }
                     toflush_stats += "\n";
                 }
+                if groups_hidden > 0 {
+                    toflush_stats += &format!("-- ... and {groups_hidden} more\n");
+                }
                 toflush_stats.truncate(toflush_stats.trim_end().len());
 
                 if !toflush_lines.is_empty() || toflush_stats != lastprinted_stats {
@@ -681,9 +779,11 @@ pub async fn process_as_tui(
 
 #[cfg(test)]
 mod tests {
+    use crate::Layout;
     use crate::Message;
     use crate::follow;
     use crate::get_statuscode_class;
+    use crate::pick_groups;
     use smol::LocalExecutor;
     use smol::Timer;
     use smol::future;
@@ -848,5 +948,82 @@ mod tests {
             );
             assert!(receiver.try_recv().is_err());
         }));
+    }
+
+    fn layout(stats_rows: u16, groups_shown: u16, number_of_lines: u16) -> Layout {
+        Layout {
+            stats_rows,
+            groups_shown,
+            number_of_lines,
+        }
+    }
+
+    #[test]
+    fn test_layout_automatic() {
+        // everything fits in half of the screen
+        assert_eq!(Layout::new(50, None, 10), layout(10, 10, 38));
+        assert_eq!(Layout::new(50, None, 25), layout(25, 25, 23));
+        // too many groups: 24 groups plus "... and 16 more"
+        assert_eq!(Layout::new(50, None, 40), layout(25, 24, 23));
+        // no groups registered yet
+        assert_eq!(Layout::new(50, None, 0), layout(0, 0, 48));
+        // tiny screens
+        assert_eq!(Layout::new(5, None, 10), layout(2, 1, 1));
+        assert_eq!(Layout::new(4, None, 10), layout(2, 1, 0));
+        assert_eq!(Layout::new(1, None, 10), layout(1, 0, 0));
+        assert_eq!(Layout::new(0, None, 10), layout(1, 0, 0));
+    }
+
+    #[test]
+    fn test_layout_requested_file_rows() {
+        // more rows requested than there are groups
+        assert_eq!(Layout::new(50, Some(100), 10), layout(10, 10, 38));
+        // more than half of the screen is fine
+        assert_eq!(Layout::new(50, Some(40), 40), layout(40, 40, 8));
+        // too many groups
+        assert_eq!(Layout::new(50, Some(10), 40), layout(10, 9, 38));
+        assert_eq!(Layout::new(50, Some(1), 40), layout(1, 0, 47));
+        // doesn't fit on the screen
+        assert_eq!(Layout::new(50, Some(48), 100), layout(48, 47, 0));
+        assert_eq!(Layout::new(50, Some(100), 100), layout(100, 100, 0));
+        assert_eq!(Layout::new(50, Some(100), 1000), layout(100, 99, 0));
+        // doesn't fit, but there aren't enough groups to need all rows
+        assert_eq!(Layout::new(50, Some(100), 47), layout(47, 47, 1));
+        // lots of groups
+        assert_eq!(Layout::new(50, Some(10), 100_000), layout(10, 9, 38));
+    }
+
+    #[test]
+    fn test_pick_groups() {
+        let activity = [Some(0), Some(3), None, Some(1), Some(100)];
+        // first time: the most recently active ones, in their original order
+        assert_eq!(pick_groups(&activity, &[], 2), vec![0, 3]);
+        assert_eq!(pick_groups(&activity, &[], 3), vec![0, 1, 3]);
+        // enough room for all
+        assert_eq!(pick_groups(&activity, &[], 5), vec![0, 1, 2, 3, 4]);
+        assert_eq!(pick_groups(&activity, &[], 10), vec![0, 1, 2, 3, 4]);
+        assert_eq!(pick_groups(&activity, &[], 0), Vec::<usize>::new());
+        assert_eq!(pick_groups(&[], &[], 3), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn test_pick_groups_is_stable() {
+        // similar activity: keep showing what we showed before
+        let activity = [Some(0), Some(3), Some(1), Some(2)];
+        assert_eq!(pick_groups(&activity, &[1, 3], 2), vec![1, 3]);
+        // a shown group went quiet: replace it with a more active one
+        let activity = [Some(0), Some(10), Some(1), Some(2)];
+        assert_eq!(pick_groups(&activity, &[1, 3], 2), vec![0, 3]);
+        // both went quiet
+        let activity = [Some(0), Some(10), Some(1), Some(20)];
+        assert_eq!(pick_groups(&activity, &[1, 3], 2), vec![0, 2]);
+        // never active
+        let activity = [Some(0), None, Some(1), Some(2)];
+        assert_eq!(pick_groups(&activity, &[1, 3], 2), vec![0, 3]);
+        // more rows than last time: keep the old ones, add the most active
+        let activity = [Some(0), Some(3), Some(1), Some(2)];
+        assert_eq!(pick_groups(&activity, &[1, 3], 3), vec![0, 1, 3]);
+        // fewer rows than last time: drop the least active
+        assert_eq!(pick_groups(&activity, &[0, 1, 3], 2), vec![0, 3]);
     }
 }
