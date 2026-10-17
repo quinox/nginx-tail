@@ -157,7 +157,8 @@ async fn sigwinch_handler(channel: SenderChannel) {
     };
 
     loop {
-        if window_changed_size.load(std::sync::atomic::Ordering::Relaxed)
+        // swap: reset the flag so we only send one message per resize
+        if window_changed_size.swap(false, std::sync::atomic::Ordering::Relaxed)
             && channel
                 .send(Message::WinCh(get_terminal_width()))
                 .await
