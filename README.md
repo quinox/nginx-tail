@@ -44,6 +44,17 @@ Output modes:
   $ nginx-tail | less -R
 ```
 
+Lots of log files:
+
+```shell
+  # by default the stats use at most half of the screen. When there are more
+  # files than fit, the most active ones are shown, followed by "... and X more"
+  $ nginx-tail
+
+  # use at most 10 rows for the stats instead:
+  $ nginx-tail --file-rows 10
+```
+
 ## Design
 
 It should do "the right thing" without configuration. A user should have a good

@@ -35,6 +35,8 @@ const HELP: &str = r#"
                                  Defaults to "screen width", set to 0 for unlimited
             --target-height      Target window height.
                                  Will be met if the log lines fit in the width of your terminal
+            --file-rows X        Show the stats of at most X files, the most active ones.
+                                 Defaults to half the window height
             --max-runtime X      Terminate after X seconds
             --combine            Combine stats of all files together
             --unmerge            Do not group http statuscodes
@@ -51,7 +53,8 @@ struct AppArgs {
     fast_generator: bool,
     #[cfg(debug_assertions)]
     slow_generator: bool,
-    target_height: u16,
+    target_height: Option<u16>,
+    file_rows: Option<u16>,
     combine_filestats: bool,
     merge_statuscodes: bool,
     max_runtime: Option<u32>,
@@ -70,9 +73,24 @@ fn main() {
     let max_runtime: Option<u32> = pargs.opt_value_from_str("--max-runtime").unwrap_or(None);
 
     // TODO: let the user specify --loglines instead: with dynamic tags you don't know the right screenheight
-    let target_height: u16 = pargs
-        .value_from_str("--target-height")
-        .unwrap_or_else(|_| get_terminal_height());
+    let target_height: Option<u16> = pargs.value_from_str("--target-height").ok();
+
+    let file_rows: Option<u16> =
+        if let Ok(reqrows) = pargs.value_from_str::<&str, String>("--file-rows") {
+            match reqrows.parse::<u16>() {
+                Ok(0) => {
+                    eprintln!("--file-rows needs to be at least 1");
+                    process::exit(1)
+                }
+                Ok(x) => Some(x),
+                Err(err) => {
+                    eprintln!("Failed to parse {reqrows} as a number: {err}");
+                    process::exit(1)
+                }
+            }
+        } else {
+            None
+        };
 
     let requested_width: Option<u16> =
         if let Ok(reqwidth) = pargs.value_from_str::<&str, String>("--max-width") {
@@ -129,6 +147,7 @@ fn main() {
         log_dirs,
         log_files,
         target_height,
+        file_rows,
         combine_filestats,
         merge_statuscodes,
         max_runtime,
@@ -159,7 +178,7 @@ async fn sigwinch_handler(channel: SenderChannel) {
     loop {
         if window_changed_size.load(std::sync::atomic::Ordering::Relaxed)
             && channel
-                .send(Message::WinCh(get_terminal_width()))
+                .send(Message::WinCh(get_terminal_width(), get_terminal_height()))
                 .await
                 .is_err()
         {
@@ -296,7 +315,7 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
         let original = nginx_tail::terminal::activate_raw_mode();
         async_exec.spawn(sigint_handler(original.ok())).detach();
 
-        if args.requested_width.is_none() {
+        if args.requested_width.is_none() || args.target_height.is_none() {
             async_exec.spawn(sigwinch_handler(sender.clone())).detach();
         };
         async_exec.spawn(periodic_print(sender.clone())).detach();
@@ -306,6 +325,7 @@ async fn innermain(args: AppArgs) -> Result<(), Error> {
             receiver,
             args.target_height,
             args.requested_width,
+            args.file_rows,
             args.filters,
         )))?;
     }
