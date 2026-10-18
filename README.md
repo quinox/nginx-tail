@@ -8,9 +8,9 @@ requests per second).
 This is a personal project. I'm not likely to accept PRs; I do welcome bug
 report, ideas and feature requests.
 
-## Screenshots
+## Screenshot
 
-![nginx-tail following the logs of a few busy sites](screenshot.svg)
+![nginx-tail following the logs of a few busy sites](screenshot.png)
 
 Regenerate it with `./make_screenshot.py` (needs `tmux`).
 

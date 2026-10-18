@@ -3,110 +3,120 @@
 <circle cx="18" cy="16" r="5.5" fill="#ff5f57"/><circle cx="36" cy="16" r="5.5" fill="#febc2e"/><circle cx="54" cy="16" r="5.5" fill="#28c840"/>
 <text x="445.0" y="20" fill="#7f848e" font-family="sans-serif" font-size="12" text-anchor="middle">nginx-tail</text>
 <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="13" fill="#abb2bf" xml:space="preserve">
-<text x="16.0" y="74">192.0.2.240 - - [17/Oct/2026:08:18:30 +0000] "GET /checkout HTTP/1.1" </text>
-<text x="562.0" y="74" fill="#98c379">200</text>
-<text x="585.4" y="74"> 5299 "-" "Mozilla/5.0 (Macintosh; In</text>
-<text x="16.0" y="91">198.51.100.45 - - [17/Oct/2026:08:18:30 +0000] "</text>
-<rect x="390.4" y="79" width="31.2" height="16" fill="#abb2bf"/>
-<text x="390.4" y="91" fill="#21252b">POST</text>
-<text x="421.6" y="91"> /v2/orders/8121 HTTP/1.1" </text>
-<text x="632.2" y="91" fill="#e5c07b">404</text>
-<text x="655.6" y="91"> 12830 "-" "Mozilla/5.0 (Mac</text>
-<text x="16.0" y="108">192.0.2.109 - - [17/Oct/2026:08:18:30 +0000] "GET /v2/orders/8121 HTTP/1.1" </text>
-<text x="608.8" y="108" fill="#98c379">200</text>
-<text x="632.2" y="108"> 9891 "-" "okhttp/5.1.0"</text>
-<text x="16.0" y="125">198.51.100.82 - - [17/Oct/2026:08:18:30 +0000] "GET /v2/orders HTTP/1.1" </text>
-<text x="585.4" y="125" fill="#e5c07b">401</text>
-<text x="608.8" y="125"> 5903 "-" "curl/8.14.1"</text>
-<text x="16.0" y="142">203.0.113.102 - - [17/Oct/2026:08:18:30 +0000] "GET /v2/stock HTTP/1.1" </text>
-<text x="577.6" y="142" fill="#98c379">200</text>
-<text x="601.0" y="142"> 30225 "-" "Mozilla/5.0 (X11; Linux</text>
-<text x="16.0" y="159">203.0.113.160 - - [17/Oct/2026:08:18:30 +0000] "GET /v2/orders HTTP/1.1" </text>
-<text x="585.4" y="159" fill="#98c379">200</text>
-<text x="608.8" y="159"> 27360 "-" "Mozilla/5.0 (Macintosh</text>
-<text x="16.0" y="176">192.0.2.146 - - [17/Oct/2026:08:18:30 +0000] "GET /v2/orders HTTP/1.1" </text>
-<text x="569.8" y="176" fill="#98c379">200</text>
-<text x="593.2" y="176"> 7122 "-" "okhttp/5.1.0"</text>
-<text x="16.0" y="193">192.0.2.202 - - [17/Oct/2026:08:18:30 +0000] "GET /v2/products?page=3 HTTP/1.1" </text>
-<text x="640.0" y="193" fill="#98c379">200</text>
-<text x="663.4" y="193"> 27128 "-" "Mozilla/5.0 (Wi</text>
-<text x="16.0" y="210">198.51.100.147 - - [17/Oct/2026:08:18:30 +0000] "GET /css/site.css HTTP/1.1" </text>
-<text x="616.6" y="210" fill="#c678dd">304</text>
-<text x="640.0" y="210"> 0 "-" "Mozilla/5.0 (Macintosh</text>
-<text x="16.0" y="227">198.51.100.104 - - [17/Oct/2026:08:18:30 +0000] "GET /fonts/inter.woff2 HTTP/1.1" </text>
-<text x="655.6" y="227" fill="#98c379">200</text>
-<text x="679.0" y="227"> 26527 "-" "Mozilla/5.0 (</text>
-<text x="16.0" y="244">198.51.100.228 - - [17/Oct/2026:08:18:30 +0000] "GET /js/app.js HTTP/1.1" </text>
-<text x="593.2" y="244" fill="#c678dd">304</text>
-<text x="616.6" y="244"> 0 "-" "Mozilla/5.0 (X11; Linux x</text>
-<text x="16.0" y="261">203.0.113.122 - - [17/Oct/2026:08:18:30 +0000] "GET /img/logo.svg HTTP/1.1" </text>
-<text x="608.8" y="261" fill="#c678dd">304</text>
-<text x="632.2" y="261"> 0 "-" "Mozilla/5.0 (X11; Linux</text>
-<text x="16.0" y="278">192.0.2.25 - - [17/Oct/2026:08:18:30 +0000] "GET /cart HTTP/1.1" </text>
-<text x="523.0" y="278" fill="#98c379">200</text>
-<text x="546.4" y="278"> 19324 "-" "Mozilla/5.0 (X11; Linux x86_64</text>
-<text x="16.0" y="295">198.51.100.217 - - [17/Oct/2026:08:18:30 +0000] "GET /account/orders HTTP/1.1" </text>
-<text x="632.2" y="295" fill="#98c379">200</text>
-<text x="655.6" y="295"> 26248 "-" "curl/8.14.1"</text>
-<text x="16.0" y="312">198.51.100.230 - - [17/Oct/2026:08:18:30 +0000] "GET / HTTP/1.1" </text>
-<text x="523.0" y="312" fill="#98c379">200</text>
-<text x="546.4" y="312"> 35859 "-" "curl/8.14.1"</text>
-<text x="16.0" y="329">192.0.2.95 - - [17/Oct/2026:08:18:30 +0000] "GET /checkout HTTP/1.1" </text>
-<text x="554.2" y="329" fill="#c678dd">304</text>
-<text x="577.6" y="329"> 0 "-" "Mozilla/5.0 (Macintosh; Intel</text>
-<text x="16.0" y="346">198.51.100.12 - - [17/Oct/2026:08:18:30 +0000] "GET /products/espresso-machine HTTP/1.1" </text>
-<text x="710.2" y="346" fill="#98c379">200</text>
-<text x="733.6" y="346"> 17462 "-" "Mozill</text>
-<text x="16.0" y="363">198.51.100.145 - - [17/Oct/2026:08:18:30 +0000] "GET /account/orders HTTP/1.1" </text>
-<text x="632.2" y="363" fill="#98c379">200</text>
-<text x="655.6" y="363"> 6537 "-" "Mozilla/5.0 (X11;</text>
-<text x="16.0" y="380">203.0.113.89 - - [17/Oct/2026:08:18:30 +0000] "GET /products/espresso-machine HTTP/1.1" </text>
-<text x="702.4" y="380" fill="#c678dd">304</text>
-<text x="725.8" y="380"> 0 "-" "okhttp/5.1.</text>
-<text x="16.0" y="397">192.0.2.142 - - [17/Oct/2026:08:18:30 +0000] "GET /products/espresso-machine HTTP/1.1" </text>
-<text x="694.6" y="397" fill="#98c379">200</text>
-<text x="718.0" y="397"> 34447 "-" "curl/8.1</text>
-<text x="16.0" y="414">203.0.113.176 - - [17/Oct/2026:08:18:30 +0000] "GET /products/espresso-machine HTTP/1.1" </text>
-<text x="710.2" y="414" fill="#c678dd">304</text>
-<text x="733.6" y="414"> 0 "-" "okhttp/5.1</text>
-<text x="16.0" y="431">192.0.2.122 - - [17/Oct/2026:08:18:30 +0000] "GET /products/espresso-machine HTTP/1.1" </text>
-<text x="694.6" y="431" fill="#98c379">200</text>
-<text x="718.0" y="431"> 2475 "-" "okhttp/5.</text>
-<text x="16.0" y="448">203.0.113.231 - - [17/Oct/2026:08:18:30 +0000] "GET /products/grinder HTTP/1.1" </text>
-<text x="640.0" y="448" fill="#98c379">200</text>
-<text x="663.4" y="448"> 9863 "-" "Mozilla/5.0 (X11</text>
-<text x="16.0" y="465">-- Output sampled at 4%</text>
-<text x="16.0" y="482">-- api        128.5 [</text>
+<text x="16.0" y="74">192.0.2.142 - - [18/Oct/2026:10:14:34 +0000] "GET /img/products/espresso.webp HTTP/1.1" </text>
+<text x="702.4" y="74" fill="#98c379">200</text>
+<text x="725.8" y="74"> 36890 "-" "curl/8.</text>
+<text x="16.0" y="91">192.0.2.205 - - [18/Oct/2026:10:14:34 +0000] "GET /js/app.js HTTP/1.1" </text>
+<text x="569.8" y="91" fill="#98c379">200</text>
+<text x="593.2" y="91"> 12288 "-" "curl/8.14.1"</text>
+<text x="16.0" y="108">198.51.100.8 - - [18/Oct/2026:10:14:34 +0000] "GET /js/app.js HTTP/1.1" </text>
+<text x="577.6" y="108" fill="#c678dd">304</text>
+<text x="601.0" y="108"> 0 "-" "curl/8.14.1"</text>
+<text x="16.0" y="125">198.51.100.43 - - [18/Oct/2026:10:14:34 +0000] "</text>
+<rect x="390.4" y="113" width="31.2" height="16" fill="#abb2bf"/>
+<text x="390.4" y="125" fill="#21252b">POST</text>
+<text x="421.6" y="125"> /v2/products?page=3 HTTP/1.1" </text>
+<text x="663.4" y="125" fill="#98c379">200</text>
+<text x="686.8" y="125"> 26389 "-" "curl/8.14.1"</text>
+<text x="16.0" y="142">192.0.2.3 - - [18/Oct/2026:10:14:34 +0000] "</text>
+<rect x="359.2" y="130" width="31.2" height="16" fill="#abb2bf"/>
+<text x="359.2" y="142" fill="#21252b">POST</text>
+<text x="390.4" y="142"> /v2/stock HTTP/1.1" </text>
+<text x="554.2" y="142" fill="#98c379">200</text>
+<text x="577.6" y="142"> 34199 "-" "okhttp/5.1.0"</text>
+<text x="16.0" y="159">203.0.113.148 - - [18/Oct/2026:10:14:34 +0000] "GET /healthz HTTP/1.1" </text>
+<text x="569.8" y="159" fill="#98c379">200</text>
+<text x="593.2" y="159"> 30547 "-" "okhttp/5.1.0"</text>
+<text x="16.0" y="176">203.0.113.129 - - [18/Oct/2026:10:14:34 +0000] "GET /v2/orders HTTP/1.1" </text>
+<text x="585.4" y="176" fill="#98c379">200</text>
+<text x="608.8" y="176"> 31838 "-" "Mozilla/5.0 (Windows N</text>
+<text x="16.0" y="193">198.51.100.236 - - [18/Oct/2026:10:14:34 +0000] "</text>
+<rect x="398.2" y="181" width="31.2" height="16" fill="#abb2bf"/>
+<text x="398.2" y="193" fill="#21252b">POST</text>
+<text x="429.4" y="193"> /v2/products?page=3 HTTP/1.1" </text>
+<text x="671.2" y="193" fill="#e5c07b">404</text>
+<text x="694.6" y="193"> 9484 "-" "Mozilla/5.0</text>
+<text x="16.0" y="210">198.51.100.117 - - [18/Oct/2026:10:14:34 +0000] "GET /v2/auth/token HTTP/1.1" </text>
+<text x="624.4" y="210" fill="#98c379">200</text>
+<text x="647.8" y="210"> 23026 "-" "Mozilla/5.0 (X11;</text>
+<text x="16.0" y="227">198.51.100.185 - - [18/Oct/2026:10:14:34 +0000] "GET /v2/orders HTTP/1.1" </text>
+<text x="593.2" y="227" fill="#98c379">200</text>
+<text x="616.6" y="227"> 19878 "-" "Mozilla/5.0 (X11; Lin</text>
+<text x="16.0" y="244">198.51.100.176 - - [18/Oct/2026:10:14:34 +0000] "GET /v2/auth/token HTTP/1.1" </text>
+<text x="624.4" y="244" fill="#98c379">200</text>
+<text x="647.8" y="244"> 29288 "-" "Mozilla/5.0 (Maci</text>
+<text x="16.0" y="261">192.0.2.145 - - [18/Oct/2026:10:14:34 +0000] "GET /v2/orders HTTP/1.1" </text>
+<text x="569.8" y="261" fill="#98c379">200</text>
+<text x="593.2" y="261"> 19342 "-" "Mozilla/5.0 (Windows NT</text>
+<text x="16.0" y="278">192.0.2.138 - - [18/Oct/2026:10:14:34 +0000] "GET /healthz HTTP/1.1" </text>
+<text x="554.2" y="278" fill="#98c379">200</text>
+<text x="577.6" y="278"> 37270 "-" "curl/8.14.1"</text>
+<text x="16.0" y="295">203.0.113.131 - - [18/Oct/2026:10:14:34 +0000] "</text>
+<rect x="390.4" y="283" width="31.2" height="16" fill="#abb2bf"/>
+<text x="390.4" y="295" fill="#21252b">POST</text>
+<text x="421.6" y="295"> /v2/products?page=3 HTTP/1.1" </text>
+<text x="663.4" y="295" fill="#98c379">200</text>
+<text x="686.8" y="295"> 35793 "-" "okhttp/5.1.0</text>
+<text x="16.0" y="312">192.0.2.195 - - [18/Oct/2026:10:14:34 +0000] "GET /v2/orders HTTP/1.1" </text>
+<text x="569.8" y="312" fill="#98c379">200</text>
+<text x="593.2" y="312"> 28062 "-" "Mozilla/5.0 (Macintosh;</text>
+<text x="16.0" y="329">198.51.100.224 - - [18/Oct/2026:10:14:34 +0000] "GET /v2/orders HTTP/1.1" </text>
+<text x="593.2" y="329" fill="#e06c75">502</text>
+<text x="616.6" y="329"> 23044 "-" "curl/8.14.1"</text>
+<text x="16.0" y="346">192.0.2.199 - - [18/Oct/2026:10:14:34 +0000] "</text>
+<rect x="374.8" y="334" width="31.2" height="16" fill="#abb2bf"/>
+<text x="374.8" y="346" fill="#21252b">POST</text>
+<text x="406.0" y="346"> /healthz HTTP/1.1" </text>
+<text x="562.0" y="346" fill="#98c379">200</text>
+<text x="585.4" y="346"> 38730 "-" "Mozilla/5.0 (Windows NT 1</text>
+<text x="16.0" y="363">203.0.113.33 - - [18/Oct/2026:10:14:34 +0000] "GET /2026/10/roasting-at-home HTTP/1.1" </text>
+<text x="694.6" y="363" fill="#98c379">200</text>
+<text x="718.0" y="363"> 8896 "-" "Mozilla/5</text>
+<text x="16.0" y="380">203.0.113.162 - - [18/Oct/2026:10:14:34 +0000] "GET /js/app.js HTTP/1.1" </text>
+<text x="585.4" y="380" fill="#98c379">200</text>
+<text x="608.8" y="380"> 9324 "-" "Mozilla/5.0 (Macintosh;</text>
+<text x="16.0" y="397">192.0.2.146 - - [18/Oct/2026:10:14:34 +0000] "GET /fonts/inter.woff2 HTTP/1.1" </text>
+<text x="632.2" y="397" fill="#98c379">200</text>
+<text x="655.6" y="397"> 18621 "-" "okhttp/5.1.0"</text>
+<text x="16.0" y="414">192.0.2.83 - - [18/Oct/2026:10:14:34 +0000] "GET /img/logo.svg HTTP/1.1" </text>
+<text x="585.4" y="414" fill="#c678dd">304</text>
+<text x="608.8" y="414"> 0 "-" "Mozilla/5.0 (Windows NT 10</text>
+<text x="16.0" y="431">203.0.113.69 - - [18/Oct/2026:10:14:34 +0000] "GET /fonts/inter.woff2 HTTP/1.1" </text>
+<text x="640.0" y="431" fill="#c678dd">304</text>
+<text x="663.4" y="431"> 0 "-" "Mozilla/5.0 (X11; L</text>
+<text x="16.0" y="448">192.0.2.247 - - [18/Oct/2026:10:14:34 +0000] "GET /img/products/espresso.webp HTTP/1.1" </text>
+<text x="702.4" y="448" fill="#c678dd">304</text>
+<text x="725.8" y="448"> 0 "-" "Mozilla/5.0</text>
+<text x="16.0" y="465">-- Output sampled at 5%</text>
+<text x="16.0" y="482">-- api         92.1 [</text>
 <text x="179.8" y="482" fill="#98c379">2xx</text>
-<text x="203.2" y="482">]                   9.6 [</text>
+<text x="203.2" y="482">]                  11.0 [</text>
 <text x="398.2" y="482" fill="#e5c07b">4xx</text>
-<text x="421.6" y="482">]     0.6 [</text>
+<text x="421.6" y="482">]     0.5 [</text>
 <text x="507.4" y="482" fill="#e06c75">5xx</text>
 <text x="530.8" y="482">]</text>
-<text x="16.0" y="499">-- blog        12.0 [</text>
+<text x="16.0" y="499">-- blog         6.0 [</text>
 <text x="179.8" y="499" fill="#98c379">2xx</text>
-<text x="203.2" y="499">]     0.0 [</text>
-<text x="289.0" y="499" fill="#c678dd">3xx</text>
-<text x="312.4" y="499">]     0.6 [</text>
+<text x="203.2" y="499">]                   0.8 [</text>
 <text x="398.2" y="499" fill="#e5c07b">4xx</text>
 <text x="421.6" y="499">]</text>
-<text x="16.0" y="516">-- intranet     1.8 [</text>
+<text x="16.0" y="516">-- intranet     2.2 [</text>
 <text x="179.8" y="516" fill="#98c379">2xx</text>
 <text x="203.2" y="516">]</text>
-<text x="16.0" y="533">-- shop       176.6 [</text>
+<text x="16.0" y="533">-- shop       127.1 [</text>
 <text x="179.8" y="533" fill="#98c379">2xx</text>
-<text x="203.2" y="533">]    26.4 [</text>
+<text x="203.2" y="533">]    23.0 [</text>
 <text x="289.0" y="533" fill="#c678dd">3xx</text>
-<text x="312.4" y="533">]    14.4 [</text>
+<text x="312.4" y="533">]    11.5 [</text>
 <text x="398.2" y="533" fill="#e5c07b">4xx</text>
-<text x="421.6" y="533">]     0.6 [</text>
+<text x="421.6" y="533">]     1.1 [</text>
 <text x="507.4" y="533" fill="#e06c75">5xx</text>
 <text x="530.8" y="533">]</text>
-<text x="16.0" y="550">-- static      55.3 [</text>
+<text x="16.0" y="550">-- static      39.5 [</text>
 <text x="179.8" y="550" fill="#98c379">2xx</text>
-<text x="203.2" y="550">]    32.4 [</text>
+<text x="203.2" y="550">]    24.1 [</text>
 <text x="289.0" y="550" fill="#c678dd">3xx</text>
-<text x="312.4" y="550">]     1.8 [</text>
+<text x="312.4" y="550">]     1.1 [</text>
 <text x="398.2" y="550" fill="#e5c07b">4xx</text>
 <text x="421.6" y="550">]</text>
 </g>
