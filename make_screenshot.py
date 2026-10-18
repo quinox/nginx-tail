@@ -199,27 +199,50 @@ def render_svg(rows):
 
 def main():
     os.chdir(Path(__file__).parent)
-    output = Path(sys.argv[1] if len(sys.argv) > 1 else "screenshot.svg")
+    output_svg = Path("screenshot.svg")
+    output_png = Path("screenshot.png")
     if not shutil.which("tmux"):
         sys.exit("Please install tmux first: sudo apt install tmux")
+    if not shutil.which("rsvg-convert"):
+        sys.exit("Please install rsvg tools first: sudo apt install librsvg2-bin")
 
+    print("Building release...")
     subprocess.run(["cargo", "build", "--release"], check=True)
-    with tempfile.TemporaryDirectory() as workdir:
-        workdir = Path(workdir)
-        stop = start_traffic(workdir / "nginx")
-        time.sleep(0.3)
-        try:
-            screen = capture(["./target/release/nginx-tail", str(workdir / "nginx")], workdir)
-        finally:
-            stop.set()
+    # Because of timing issues our runs aren't repeatable, even with
+    # setting the random seed.
+    # We'll run a few times if it doesn't match our expectations
+    for i in range(0, 5):
+        print("Running nginx-tail and capturing its output...")
+        with tempfile.TemporaryDirectory() as workdir:
+            workdir = Path(workdir)
+            stop = start_traffic(workdir / "nginx")
+            time.sleep(0.3)
+            try:
+                screen = capture(["./target/release/nginx-tail", str(workdir / "nginx")], workdir)
+            finally:
+                stop.set()
 
-    rows = parse(screen)
-    if not rows:
-        sys.exit("The screen is empty, did nginx-tail start?")
-    output.write_text(render_svg(rows))
+        rows = parse(screen)
+        if not rows:
+            sys.exit("The screen is empty, did nginx-tail start?")
+        svg = render_svg(rows)
+        post_count = svg.count(">POST<")
+        get_count = svg.count(' "GET ')
+        if post_count >= 3 and get_count >= 3:
+            print(f"QA passed: {post_count} POST and {get_count} GET present")
+            break
+        print(f"Not enough POST/GET present ({post_count} and {get_count}); retrying")
+    else:
+        print("QA failed multiple times in a row! Fixme?")
+    output_svg.write_text(svg)
     # also show it in the terminal, as a quick check
-    print("\n".join("".join(char for char, _ in cells).rstrip() for cells in rows))
-    print(f"\nWrote {output}")
+    print("Captured:")
+    print("\n  ".join("".join(char for char, _ in cells).rstrip() for cells in rows))
+    print(f"\nWrote {output_svg}")
+    # font handling is tricky with SVG. rsvg seems to be quite accurate
+    subprocess.run(["rsvg-convert", "--format=png", "--keep-aspect-ratio", "--width=1200", str(output_svg), "--output", str(output_png)], check=True)
+    print(f"Converted to {output_png}")
+    print("All done")
 
 
 if __name__ == "__main__":
